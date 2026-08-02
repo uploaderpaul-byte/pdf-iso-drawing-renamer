@@ -109,11 +109,10 @@ pip install pyinstaller
 From inside the `pdf_renamer_app` folder, run:
 
 ```bat
-pyinstaller ^
+python -m PyInstaller ^
   --name "PDF_ISO_Renamer" ^
   --onefile ^
   --windowed ^
-  --icon icon.ico ^
   --hidden-import customtkinter ^
   --hidden-import tkinterdnd2 ^
   --hidden-import PIL._tkinter_finder ^
@@ -121,6 +120,8 @@ pyinstaller ^
   --collect-data tkinterdnd2 ^
   app.py
 ```
+
+> **Note:** `python -m PyInstaller` is used instead of the bare `pyinstaller` command because Python 3.14 does not automatically add the Scripts folder to PATH on Windows.
 
 > **`--onefile`** – packages everything into a single `.exe`  
 > **`--windowed`** – suppresses the console window  
