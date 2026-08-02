@@ -1,9 +1,11 @@
 @echo off
 REM ============================================================
 REM  PDF ISO Drawing Renamer — Windows .exe build helper
-REM  Double-click this file (or run from Command Prompt) from
-REM  inside the pdf_renamer_app folder.
+REM  Double-click this file OR run it from any location.
 REM ============================================================
+
+REM Always work from the folder this .bat file lives in
+cd /d "%~dp0"
 
 echo === PDF ISO Drawing Renamer — PyInstaller Build ===
 echo.
