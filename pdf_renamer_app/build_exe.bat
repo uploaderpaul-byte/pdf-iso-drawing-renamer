@@ -35,10 +35,10 @@ if errorlevel 1 (
     exit /b 1
 )
 
-REM Build the .exe
+REM Build the .exe  (using "python -m PyInstaller" avoids PATH issues on Python 3.14+)
 echo.
 echo [3/3] Building .exe with PyInstaller...
-pyinstaller PDF_ISO_Renamer.spec
+python -m PyInstaller PDF_ISO_Renamer.spec
 
 if errorlevel 1 (
     echo.
