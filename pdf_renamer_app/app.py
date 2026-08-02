@@ -487,6 +487,255 @@ class InteractiveROIDialog(ctk.CTkToplevel):
 
 
 # ===========================================================================
+# Review & Approve Dialog
+# ===========================================================================
+
+class ReviewDialog(ctk.CTkToplevel):
+    """
+    Shows every file's OCR result as an editable proposed name.
+    User can rename any entry, skip failed ones, then click Approve All & Save.
+    self.approved_items is set to a list of dicts on approval, or None on cancel.
+    """
+
+    BG      = "#1a1a2e"
+    PANEL   = "#16213e"
+    ACCENT  = "#0f3460"
+    HILIGHT = "#e94560"
+    FG      = "#e0e0e0"
+    FG_DIM  = "#9e9e9e"
+    OK_BG   = "#1a3a1a"
+    FAIL_BG = "#3a1a1a"
+    OK_FG   = "#4caf50"
+    FAIL_FG = "#ff9800"
+
+    def __init__(self, parent, results: list):
+        super().__init__(parent)
+        self.title("Review & Approve Names — edit any name, then click Approve All & Save")
+        self.configure(fg_color=self.BG)
+        self.resizable(True, True)
+        self.grab_set()
+
+        self.results = results
+        self.approved_items = None   # filled on approval
+
+        # one tk.StringVar per row for the editable name
+        self._name_vars: list[tk.StringVar] = []
+        # one tk.BooleanVar per row for the skip checkbox
+        self._skip_vars: list[tk.BooleanVar] = []
+
+        self._build_ui()
+
+        # Size the window to content (max 1000 × 700)
+        n = len(results)
+        h = min(140 + n * 58 + 80, 720)
+        self.geometry(f"1020x{h}")
+        self.minsize(800, 400)
+
+    # ------------------------------------------------------------------
+    # UI
+    # ------------------------------------------------------------------
+
+    def _build_ui(self):
+        self.grid_rowconfigure(1, weight=1)
+        self.grid_columnconfigure(0, weight=1)
+
+        # ── header ───────────────────────────────────────────────────
+        hdr = ctk.CTkFrame(self, fg_color=self.PANEL, corner_radius=0)
+        hdr.grid(row=0, column=0, sticky="ew")
+        hdr.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(hdr, text="Review & Approve Names",
+                     font=ctk.CTkFont(size=16, weight="bold"),
+                     text_color=self.HILIGHT
+                     ).grid(row=0, column=0, sticky="w", padx=16, pady=(10, 2))
+        ctk.CTkLabel(hdr,
+                     text="Edit any proposed name below. "
+                          "Tick 'Skip' to exclude a file. "
+                          "Click Approve All & Save when ready.",
+                     font=ctk.CTkFont(size=11), text_color=self.FG_DIM
+                     ).grid(row=1, column=0, sticky="w", padx=16, pady=(0, 10))
+
+        # ── column headers ───────────────────────────────────────────
+        col_hdr = ctk.CTkFrame(self, fg_color="#0d0d1f", corner_radius=0)
+        col_hdr.grid(row=1, column=0, sticky="new")
+        col_hdr.grid_columnconfigure(1, weight=1)
+        col_hdr.grid_columnconfigure(3, weight=1)
+
+        for col, label, w in [
+            (0, "#",               40),
+            (1, "Original Filename", 0),
+            (2, "OCR Raw Text",    220),
+            (3, "New Name  (editable)", 0),
+            (4, "Skip",            50),
+        ]:
+            ctk.CTkLabel(col_hdr, text=label,
+                         font=ctk.CTkFont(size=10, weight="bold"),
+                         text_color=self.FG_DIM,
+                         width=w if w else 0, anchor="w"
+                         ).grid(row=0, column=col, sticky="ew",
+                                padx=(8 if col == 0 else 4, 4), pady=6)
+
+        # ── scrollable rows ───────────────────────────────────────────
+        scroll_outer = ctk.CTkFrame(self, fg_color=self.BG, corner_radius=0)
+        scroll_outer.grid(row=2, column=0, sticky="nsew")
+        self.grid_rowconfigure(2, weight=1)
+        scroll_outer.grid_rowconfigure(0, weight=1)
+        scroll_outer.grid_columnconfigure(0, weight=1)
+
+        # Use plain tk canvas + scrollbar for the scrollable area
+        canvas = tk.Canvas(scroll_outer, bg=self.BG, highlightthickness=0)
+        vsb    = tk.Scrollbar(scroll_outer, orient="vertical",
+                              command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.grid(row=0, column=1, sticky="ns")
+        canvas.grid(row=0, column=0, sticky="nsew")
+
+        inner = tk.Frame(canvas, bg=self.BG)
+        win_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _on_configure(e):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        def _on_canvas_resize(e):
+            canvas.itemconfig(win_id, width=e.width)
+
+        inner.bind("<Configure>", _on_configure)
+        canvas.bind("<Configure>", _on_canvas_resize)
+
+        # mouse-wheel scrolling
+        def _on_wheel(e):
+            canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        canvas.bind_all("<MouseWheel>", _on_wheel)
+
+        inner.grid_columnconfigure(1, weight=1)
+        inner.grid_columnconfigure(3, weight=1)
+
+        for idx, item in enumerate(self.results):
+            row_bg = self.OK_BG if item["status"] == "ok" else self.FAIL_BG
+            name_var = tk.StringVar(value=item["proposed"])
+            skip_var = tk.BooleanVar(value=(item["status"] == "failed"))
+            self._name_vars.append(name_var)
+            self._skip_vars.append(skip_var)
+
+            # row container
+            row_frame = tk.Frame(inner, bg=row_bg, pady=2)
+            row_frame.grid(row=idx, column=0, columnspan=5,
+                           sticky="ew", padx=4, pady=2)
+            row_frame.grid_columnconfigure(1, weight=1)
+            row_frame.grid_columnconfigure(3, weight=1)
+            inner.grid_columnconfigure(0, weight=1)
+
+            # index
+            tk.Label(row_frame, text=str(idx), bg=row_bg, fg=self.FG_DIM,
+                     font=("Consolas", 10), width=3, anchor="e"
+                     ).grid(row=0, column=0, padx=(8, 4), sticky="w")
+
+            # original filename
+            tk.Label(row_frame, text=item["original"], bg=row_bg, fg=self.FG,
+                     font=("Consolas", 10), anchor="w"
+                     ).grid(row=0, column=1, sticky="ew", padx=(0, 8))
+
+            # OCR raw / error
+            ocr_text  = item["ocr_raw"] if item["status"] == "ok" else f"⚠ {item['error']}"
+            ocr_color = self.OK_FG if item["status"] == "ok" else self.FAIL_FG
+            tk.Label(row_frame, text=ocr_text, bg=row_bg, fg=ocr_color,
+                     font=("Consolas", 9), anchor="w", width=28, wraplength=220
+                     ).grid(row=0, column=2, sticky="ew", padx=(0, 8))
+
+            # editable name entry
+            entry = tk.Entry(row_frame, textvariable=name_var,
+                             bg=self.ACCENT, fg=self.FG,
+                             insertbackground=self.FG,
+                             relief="flat", font=("Consolas", 10),
+                             disabledbackground="#1a1a2e",
+                             disabledforeground="#555555")
+            entry.grid(row=0, column=3, sticky="ew", padx=(0, 8), ipady=4)
+
+            # disable entry when skip is ticked
+            def _toggle_entry(e=entry, v=skip_var):
+                e.configure(state="disabled" if v.get() else "normal")
+
+            # skip checkbox
+            tk.Checkbutton(row_frame, text="Skip", variable=skip_var,
+                           bg=row_bg, fg=self.FG_DIM,
+                           activebackground=row_bg, selectcolor=self.ACCENT,
+                           font=("Consolas", 10),
+                           command=_toggle_entry
+                           ).grid(row=0, column=4, padx=(0, 8))
+
+            # pre-disable if initially skipped
+            if skip_var.get():
+                entry.configure(state="disabled")
+
+        # ── footer buttons ────────────────────────────────────────────
+        footer = ctk.CTkFrame(self, fg_color=self.PANEL, corner_radius=0)
+        footer.grid(row=3, column=0, sticky="ew")
+        footer.grid_columnconfigure(0, weight=1)
+
+        # summary label
+        ok_count   = sum(1 for r in self.results if r["status"] == "ok")
+        fail_count = len(self.results) - ok_count
+        summary = f"{ok_count} OCR success"
+        if fail_count:
+            summary += f"  ·  {fail_count} OCR failed (ticked Skip by default — untick to include with a manual name)"
+        ctk.CTkLabel(footer, text=summary,
+                     font=ctk.CTkFont(size=11), text_color=self.FG_DIM
+                     ).grid(row=0, column=0, sticky="w", padx=16, pady=(8, 4))
+
+        btn_row = ctk.CTkFrame(footer, fg_color="transparent")
+        btn_row.grid(row=1, column=0, pady=(0, 10))
+
+        ctk.CTkButton(btn_row,
+                      text="✔  Approve All & Save",
+                      font=ctk.CTkFont(size=13, weight="bold"),
+                      fg_color=self.HILIGHT, hover_color="#c73652",
+                      width=200, height=36,
+                      command=self._approve
+                      ).pack(side="left", padx=8)
+
+        ctk.CTkButton(btn_row,
+                      text="Cancel",
+                      font=ctk.CTkFont(size=13),
+                      fg_color="#2d2d4e", hover_color="#3d3d5e",
+                      width=100, height=36,
+                      command=self.destroy
+                      ).pack(side="left", padx=8)
+
+    # ------------------------------------------------------------------
+    # Approval
+    # ------------------------------------------------------------------
+
+    def _approve(self):
+        approved = []
+        for item, name_var, skip_var in zip(
+                self.results, self._name_vars, self._skip_vars):
+            if skip_var.get():
+                continue
+            final = name_var.get().strip()
+            if not final:
+                messagebox.showwarning("Empty Name",
+                    f"'{item['original']}' has an empty name.\n"
+                    "Please enter a name or tick Skip.", parent=self)
+                return
+            # sanitise in case user typed invalid chars
+            final = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', final)
+            final = re.sub(r'[_\s]+', ' ', final).strip('_ ')
+            approved.append({
+                "pdf_path":   item["pdf_path"],
+                "original":   item["original"],
+                "final_name": final,
+            })
+
+        if not approved:
+            messagebox.showwarning("Nothing to Save",
+                "All files are marked Skip. Untick at least one to save.",
+                parent=self)
+            return
+
+        self.approved_items = approved
+        self.destroy()
+
+
+# ===========================================================================
 # Main Application
 # ===========================================================================
 
@@ -746,7 +995,7 @@ class PDFRenamerApp:
         self.log_box.configure(state="disabled")
 
     # ------------------------------------------------------------------
-    # Processing
+    # Phase 1 — OCR scan (background thread)
     # ------------------------------------------------------------------
 
     def _start_processing(self):
@@ -757,54 +1006,109 @@ class PDFRenamerApp:
             return
         self._clear_log()
         self.processing = True
-        self.run_btn.configure(state="disabled", text="Processing…")
+        self.run_btn.configure(state="disabled", text="Scanning…")
         self.progress_var.set(0)
-        threading.Thread(target=self._process_all, daemon=True).start()
+        threading.Thread(target=self._ocr_phase, daemon=True).start()
 
-    def _process_all(self):
-        files  = list(self.pdf_files)
-        total  = len(files)
-        roi    = dict(self.roi)   # snapshot so mid-run changes don't affect it
+    def _ocr_phase(self):
+        """Run OCR on every file, build a results list, then open the review dialog."""
+        files = list(self.pdf_files)
+        total = len(files)
+        roi   = dict(self.roi)
+        results = []   # list of dicts passed to ReviewDialog
+
+        self._log(f"Scanning {total} file(s) with OCR…", "info")
+
+        for idx, pdf_path in enumerate(files, start=1):
+            fname = os.path.basename(pdf_path)
+            self._log(f"[{idx}/{total}] OCR: {fname}", "info")
+            try:
+                raw = extract_text_from_region(pdf_path, roi)
+                if not raw:
+                    raise ValueError("OCR returned empty text")
+                proposed = sanitise_filename(raw) + " ISO DWG"
+                results.append({
+                    "pdf_path": pdf_path,
+                    "original": fname,
+                    "ocr_raw":  raw,
+                    "proposed": proposed,
+                    "status":   "ok",
+                    "error":    "",
+                })
+                self._log(f"       → {proposed}", "success")
+            except Exception as exc:
+                results.append({
+                    "pdf_path": pdf_path,
+                    "original": fname,
+                    "ocr_raw":  "",
+                    "proposed": os.path.splitext(fname)[0],
+                    "status":   "failed",
+                    "error":    str(exc),
+                })
+                self._log(f"       ⚠ OCR failed: {exc}", "warning")
+            self.root.after(0, self.progress_var.set, (idx / total) * 0.5)
+
+        self._log("OCR complete — opening review window…", "info")
+        self.root.after(0, self._open_review_dialog, results)
+
+    # ------------------------------------------------------------------
+    # Phase 2 — Review dialog (main thread)
+    # ------------------------------------------------------------------
+
+    def _open_review_dialog(self, results: list):
+        self.run_btn.configure(text="Reviewing…")
+        dlg = ReviewDialog(self.root, results)
+        self.root.wait_window(dlg)
+
+        if dlg.approved_items is None:
+            # User cancelled
+            self._log("Cancelled — no files saved.", "warning")
+            self._processing_complete()
+            return
 
         if self.output_dir:
             master_dir = os.path.join(self.output_dir, "Processed_ISO_Drawings")
         else:
-            master_dir = os.path.join(os.path.dirname(files[0]),
-                                      "Processed_ISO_Drawings")
+            master_dir = os.path.join(
+                os.path.dirname(results[0]["pdf_path"]), "Processed_ISO_Drawings")
+
+        self.run_btn.configure(text="Saving…")
+        threading.Thread(
+            target=self._save_phase,
+            args=(dlg.approved_items, master_dir),
+            daemon=True
+        ).start()
+
+    # ------------------------------------------------------------------
+    # Phase 3 — Save approved files (background thread)
+    # ------------------------------------------------------------------
+
+    def _save_phase(self, items: list, master_dir: str):
+        total   = len(items)
+        success = fail = 0
         os.makedirs(master_dir, exist_ok=True)
-        self._log(f"Master output folder: {master_dir}", "info")
         self._log("─" * 60, "info")
+        self._log(f"Saving {total} approved file(s) → {master_dir}", "info")
 
-        success_count = fail_count = 0
-
-        for idx, pdf_path in enumerate(files, start=1):
-            fname = os.path.basename(pdf_path)
-            self._log(f"[{idx}/{total}] {fname}", "info")
+        for idx, item in enumerate(items, start=1):
+            pdf_path  = item["pdf_path"]
+            new_name  = item["final_name"]     # set by ReviewDialog
+            new_pdf   = f"{new_name}.pdf"
+            sub_folder = os.path.join(master_dir, new_name)
             try:
-                raw_text = extract_text_from_region(pdf_path, roi)
-                self._log(f"       OCR: {repr(raw_text)}", "info")
-                if not raw_text:
-                    raise ValueError(
-                        "OCR returned empty — open 'Set ROI' and refine the box, "
-                        "or try Auto-Detect")
-                clean    = sanitise_filename(raw_text)
-                new_name = f"{clean} ISO DWG"
-                new_pdf  = f"{new_name}.pdf"
-                sub_folder = os.path.join(master_dir, new_name)
                 os.makedirs(sub_folder, exist_ok=True)
                 shutil.copy2(pdf_path, os.path.join(sub_folder, new_pdf))
-                self._log(f"       → {os.path.join(new_name, new_pdf)}", "success")
-                success_count += 1
+                self._log(f"[{idx}/{total}] ✔ {new_name}", "success")
+                success += 1
             except Exception as exc:
-                self._log(f"       ERROR: {exc}", "error")
-                fail_count += 1
-            self.root.after(0, self.progress_var.set, idx / total)
+                self._log(f"[{idx}/{total}] ✖ {new_name}: {exc}", "error")
+                fail += 1
+            self.root.after(0, self.progress_var.set, 0.5 + (idx / total) * 0.5)
 
         self._log("─" * 60, "info")
         self._log(
-            f"Done — {success_count} succeeded, {fail_count} failed.  "
-            f"Output: {master_dir}",
-            "success" if fail_count == 0 else "warning")
+            f"Done — {success} saved, {fail} failed.  Output: {master_dir}",
+            "success" if fail == 0 else "warning")
         self.root.after(0, self._processing_complete)
 
     def _processing_complete(self):
