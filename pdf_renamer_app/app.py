@@ -1,10 +1,10 @@
 """
-PDF ISO Drawing Renamer
-=======================
-Extracts handwritten Circuit ID / Equipment text from the title block of
-engineering PDFs using OCR, renames each file to "[Circuit ID] ISO DWG.pdf",
-and organises everything into per-drawing sub-folders inside a master output
-folder.
+PDF Circuit ID Extractor
+========================
+Extracts Circuit ID text from the title block of engineering PDFs using
+EasyOCR (deep-learning based — handles handwriting and printed text),
+renames each file to "[Circuit ID] ISO DWG.pdf", and organises everything
+into per-drawing sub-folders inside a master output folder.
 """
 
 # ---------------------------------------------------------------------------
@@ -23,9 +23,7 @@ def _show_fatal(exc):
             f"The application failed to start:\n\n{exc}\n\n"
             "Ensure all dependencies are installed:\n"
             "  python -m pip install customtkinter Pillow PyMuPDF "
-            "pytesseract opencv-python numpy\n\n"
-            "Also make sure Tesseract-OCR is installed at:\n"
-            r"  C:\Program Files\Tesseract-OCR\tesseract.exe")
+            "easyocr opencv-python numpy")
         _r.destroy()
     except Exception:
         pass
@@ -57,26 +55,51 @@ except Exception as e:
     _show_fatal(f"opencv-python/numpy not installed.\nRun: python -m pip install opencv-python numpy\n\n{e}")
 
 try:
-    import pytesseract
-    from PIL import Image, ImageTk, ImageDraw
+    from PIL import Image, ImageTk
 except Exception as e:
-    _show_fatal(f"pytesseract/Pillow not installed.\nRun: python -m pip install pytesseract Pillow\n\n{e}")
+    _show_fatal(f"Pillow not installed.\nRun: python -m pip install Pillow\n\n{e}")
+
+try:
+    import easyocr
+except Exception as e:
+    _show_fatal(f"easyocr not installed.\nRun: python -m pip install easyocr\n\n{e}")
 
 # ---------------------------------------------------------------------------
-# Tesseract path
+# EasyOCR reader — lazy singleton, initialised in background on first use
 # ---------------------------------------------------------------------------
-_BASE = sys._MEIPASS if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
-_BUNDLED_TESS = os.path.join(_BASE, "tesseract", "tesseract.exe")
-_SYSTEM_TESS  = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-if os.path.exists(_BUNDLED_TESS):
-    pytesseract.pytesseract.tesseract_cmd = _BUNDLED_TESS
-elif os.path.exists(_SYSTEM_TESS):
-    pytesseract.pytesseract.tesseract_cmd = _SYSTEM_TESS
+_ocr_reader      = None
+_ocr_reader_lock = threading.Lock()
+_ocr_init_event  = threading.Event()   # set when reader is ready
+
+
+def _init_reader_bg():
+    """Load EasyOCR model in a background thread so the UI stays responsive."""
+    global _ocr_reader
+    with _ocr_reader_lock:
+        if _ocr_reader is None:
+            _ocr_reader = easyocr.Reader(
+                ['en'], gpu=False, verbose=False,
+                # store downloaded models next to the exe when frozen
+                model_storage_directory=os.path.join(
+                    os.path.expanduser("~"), ".EasyOCR", "model"),
+            )
+    _ocr_init_event.set()
+
+
+def get_ocr_reader() -> easyocr.Reader:
+    """Return the reader, blocking until it is ready."""
+    if not _ocr_init_event.is_set():
+        _ocr_init_event.wait()
+    return _ocr_reader
+
+
+# Start warming up the model immediately in the background
+threading.Thread(target=_init_reader_bg, daemon=True).start()
 
 # ---------------------------------------------------------------------------
-# Config persistence  (~/.pdf_iso_renamer_config.json)
+# Config persistence  (~/.pdf_circ_id_extractor.json)
 # ---------------------------------------------------------------------------
-CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".pdf_iso_renamer_config.json")
+CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".pdf_circ_id_extractor.json")
 
 DEFAULT_ROI = {"left": 0.50, "top": 0.88, "right": 0.85, "bottom": 0.95}
 RENDER_DPI  = 300
@@ -101,24 +124,24 @@ def save_config(cfg: dict):
 
 
 # ===========================================================================
-# OCR helpers
+# OCR helpers  (EasyOCR — handles handwriting and printed text)
 # ===========================================================================
 
-def preprocess_for_ocr(img_gray: np.ndarray) -> np.ndarray:
-    h, w = img_gray.shape
-    if w < 400:
-        scale = 400 / w
-        img_gray = cv2.resize(img_gray, (int(w * scale), int(h * scale)),
-                              interpolation=cv2.INTER_CUBIC)
-    img_gray = cv2.fastNlMeansDenoising(img_gray, h=15,
-                                        templateWindowSize=7, searchWindowSize=21)
-    binary = cv2.adaptiveThreshold(
-        img_gray, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        blockSize=31, C=10)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-    return cv2.dilate(binary, kernel, iterations=1)
+def _preprocess_for_ocr(img_rgb: np.ndarray) -> np.ndarray:
+    """Light preprocessing: upscale if tiny, mild denoise. EasyOCR prefers colour."""
+    h, w = img_rgb.shape[:2]
+    # upscale very small crops so the model has enough pixels to work with
+    if w < 600:
+        scale = 600 / w
+        img_rgb = cv2.resize(img_rgb,
+                             (int(w * scale), int(h * scale)),
+                             interpolation=cv2.INTER_CUBIC)
+    # mild denoise without destroying handwriting strokes
+    img_rgb = cv2.fastNlMeansDenoisingColored(img_rgb, None,
+                                              h=7, hColor=7,
+                                              templateWindowSize=7,
+                                              searchWindowSize=21)
+    return img_rgb
 
 
 def extract_text_from_region(pdf_path: str, roi: dict, page_index: int = 0) -> str:
@@ -127,14 +150,22 @@ def extract_text_from_region(pdf_path: str, roi: dict, page_index: int = 0) -> s
     pw, ph = page.rect.width, page.rect.height
     clip = fitz.Rect(roi["left"]*pw, roi["top"]*ph,
                      roi["right"]*pw, roi["bottom"]*ph)
-    mat  = fitz.Matrix(RENDER_DPI/72, RENDER_DPI/72)
-    pix  = page.get_pixmap(matrix=mat, clip=clip, colorspace=fitz.csGRAY)
+    mat  = fitz.Matrix(RENDER_DPI / 72, RENDER_DPI / 72)
+    pix  = page.get_pixmap(matrix=mat, clip=clip, colorspace=fitz.csRGB)
     doc.close()
-    arr  = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width)
-    proc = preprocess_for_ocr(arr)
-    text = pytesseract.image_to_string(proc,
-               config=r"--oem 3 --psm 6 -c tessedit_char_blacklist=|")
-    return text.strip()
+
+    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
+              pix.height, pix.width, 3)
+    img = _preprocess_for_ocr(img)
+
+    reader  = get_ocr_reader()
+    results = reader.readtext(img, detail=1, paragraph=False,
+                              width_ths=0.9, ycenter_ths=0.5)
+
+    # Sort results top-to-bottom, left-to-right, then join
+    results.sort(key=lambda r: (r[0][0][1], r[0][0][0]))
+    texts = [text for (_, text, conf) in results if conf > 0.15]
+    return " ".join(texts).strip()
 
 
 def sanitise_filename(raw: str) -> str:
@@ -755,7 +786,7 @@ class PDFRenamerApp:
         ctk.set_default_color_theme("blue")
 
         self.root = ctk.CTk()
-        self.root.title("PDF ISO Drawing Renamer")
+        self.root.title("PDF Circuit ID Extractor")
         self.root.geometry("900x720")
         self.root.minsize(760, 600)
         self.root.configure(fg_color=self.BG)
@@ -786,15 +817,27 @@ class PDFRenamerApp:
         outer.grid_rowconfigure(4, weight=1)
         outer.grid_columnconfigure(0, weight=1)
 
-        ctk.CTkLabel(outer, text="PDF ISO Drawing Renamer",
+        title_row = ctk.CTkFrame(outer, fg_color="transparent")
+        title_row.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+        title_row.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(title_row, text="PDF Circuit ID Extractor",
                      font=ctk.CTkFont(size=22, weight="bold"),
                      text_color=self.HILIGHT
-                     ).grid(row=0, column=0, sticky="w", pady=(0, 4))
+                     ).grid(row=0, column=0, sticky="w")
+
+        self.ocr_status_lbl = ctk.CTkLabel(
+            title_row, text="⏳ Loading OCR model…",
+            font=ctk.CTkFont(size=11), text_color=self.WARNING)
+        self.ocr_status_lbl.grid(row=0, column=1, sticky="e")
 
         ctk.CTkLabel(outer,
-                     text="Extract handwritten Circuit IDs via OCR  ·  Rename  ·  Organise",
+                     text="Extract Circuit IDs via deep-learning OCR  ·  Review & Approve  ·  Rename  ·  Organise",
                      font=ctk.CTkFont(size=12), text_color=self.FG_DIM
                      ).grid(row=1, column=0, sticky="w", pady=(0, 12))
+
+        # Poll until EasyOCR model is ready, then update the label
+        self._poll_ocr_ready()
 
         ctrl = ctk.CTkFrame(outer, fg_color=self.PANEL, corner_radius=10)
         ctrl.grid(row=2, column=0, sticky="ew", pady=(0, 10))
@@ -909,6 +952,17 @@ class PDFRenamerApp:
         sb = tk.Scrollbar(fl, orient="vertical", command=self.file_listbox.yview)
         sb.grid(row=0, column=1, sticky="ns")
         self.file_listbox.configure(yscrollcommand=sb.set)
+
+    # ------------------------------------------------------------------
+    # OCR-ready polling
+    # ------------------------------------------------------------------
+
+    def _poll_ocr_ready(self):
+        if _ocr_init_event.is_set():
+            self.ocr_status_lbl.configure(
+                text="✔ OCR model ready", text_color=self.SUCCESS)
+        else:
+            self.root.after(500, self._poll_ocr_ready)
 
     # ------------------------------------------------------------------
     # File management
