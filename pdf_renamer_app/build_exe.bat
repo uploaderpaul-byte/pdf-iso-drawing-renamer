@@ -1,38 +1,31 @@
 @echo off
 REM ============================================================
-REM  PDF ISO Drawing Renamer — Windows .exe build helper
-REM  v3 — fully self-contained, no PATH assumptions
+REM  PDF ISO Drawing Renamer — Self-Contained Build Script v4
+REM  Only needs app.py in the same folder. No other files needed.
 REM ============================================================
-
-REM Step 0: move into the folder this .bat lives in
 cd /d "%~dp0"
 
+echo.
 echo ============================================================
+echo  PDF ISO Drawing Renamer - Building .exe
 echo  Working folder: %CD%
 echo ============================================================
-echo.
-echo === PDF ISO Drawing Renamer ^- PyInstaller Build ===
 echo.
 
 REM ── Check Python ────────────────────────────────────────────
 python --version >nul 2>&1
 if errorlevel 1 (
-    echo ERROR: Python not found in PATH.
-    echo Install Python 3.10-3.13 from https://www.python.org/ and try again.
-    pause
-    exit /b 1
+    echo ERROR: Python not found. Install from https://www.python.org/
+    pause & exit /b 1
 )
-for /f "tokens=*" %%v in ('python --version 2^>^&1') do echo Python found: %%v
-echo.
 
-REM ── Install dependencies (python -m pip avoids PATH issues) ──
-echo [1/3] Installing Python dependencies from "%~dp0requirements.txt" ...
-python -m pip install -r "%~dp0requirements.txt"
+REM ── Install all dependencies inline (no requirements.txt needed) ──
+echo [1/3] Installing dependencies...
+python -m pip install --upgrade pip --quiet
+python -m pip install customtkinter Pillow PyMuPDF pytesseract opencv-python tkinterdnd2 numpy
 if errorlevel 1 (
-    echo.
-    echo ERROR: pip install failed. See output above.
-    pause
-    exit /b 1
+    echo ERROR: Dependency install failed.
+    pause & exit /b 1
 )
 
 REM ── Install PyInstaller ──────────────────────────────────────
@@ -40,27 +33,35 @@ echo.
 echo [2/3] Installing PyInstaller...
 python -m pip install pyinstaller
 if errorlevel 1 (
-    echo.
-    echo ERROR: Could not install PyInstaller. See output above.
-    pause
-    exit /b 1
+    echo ERROR: PyInstaller install failed.
+    pause & exit /b 1
 )
 
 REM ── Build the .exe ───────────────────────────────────────────
 echo.
-echo [3/3] Building .exe (this takes 2-4 minutes)...
-python -m PyInstaller "%~dp0PDF_ISO_Renamer.spec"
+echo [3/3] Building .exe (takes 2-5 minutes, please wait)...
+python -m PyInstaller ^
+    --name "PDF_ISO_Renamer" ^
+    --onefile ^
+    --windowed ^
+    --hidden-import customtkinter ^
+    --hidden-import tkinterdnd2 ^
+    --hidden-import PIL._tkinter_finder ^
+    --collect-data customtkinter ^
+    --collect-data tkinterdnd2 ^
+    "%~dp0app.py"
+
 if errorlevel 1 (
     echo.
-    echo ERROR: PyInstaller build failed. See output above.
-    pause
-    exit /b 1
+    echo ERROR: Build failed. See output above.
+    pause & exit /b 1
 )
 
 echo.
 echo ============================================================
-echo  BUILD COMPLETE
-echo  Your .exe is at:  %~dp0dist\PDF_ISO_Renamer.exe
+echo  DONE! Your .exe is here:
+echo  %~dp0dist\PDF_ISO_Renamer.exe
+echo  Double-click that file to run the app.
 echo ============================================================
 echo.
 pause
