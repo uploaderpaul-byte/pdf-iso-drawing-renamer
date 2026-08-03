@@ -65,21 +65,25 @@ except Exception as e:
     _show_fatal(f"easyocr not installed.\nRun: python -m pip install easyocr\n\n{e}")
 
 # ---------------------------------------------------------------------------
-# EasyOCR reader — lazy singleton, initialised in background on first use
+# EasyOCR reader — lazy singleton, only loaded when engine == "easyocr"
 # ---------------------------------------------------------------------------
 _ocr_reader      = None
 _ocr_reader_lock = threading.Lock()
-_ocr_init_event  = threading.Event()   # set when reader is ready
+_ocr_init_event  = threading.Event()   # set when reader is ready (or skipped)
 
 
 def _init_reader_bg():
     """Load EasyOCR model in a background thread so the UI stays responsive."""
     global _ocr_reader
+    cfg = load_config()
+    if cfg.get("ocr_engine", "gemini") != "easyocr":
+        # Not using EasyOCR — mark as ready immediately so nothing blocks
+        _ocr_init_event.set()
+        return
     with _ocr_reader_lock:
         if _ocr_reader is None:
             _ocr_reader = easyocr.Reader(
                 ['en'], gpu=False, verbose=False,
-                # store downloaded models next to the exe when frozen
                 model_storage_directory=os.path.join(
                     os.path.expanduser("~"), ".EasyOCR", "model"),
             )
@@ -93,7 +97,7 @@ def get_ocr_reader() -> easyocr.Reader:
     return _ocr_reader
 
 
-# Start warming up the model immediately in the background
+# Kick off in background immediately (no-ops fast when not using EasyOCR)
 threading.Thread(target=_init_reader_bg, daemon=True).start()
 
 # ---------------------------------------------------------------------------
@@ -124,27 +128,89 @@ def save_config(cfg: dict):
 
 
 # ===========================================================================
-# OCR helpers  (EasyOCR — handles handwriting and printed text)
+# OCR engines
 # ===========================================================================
 
-def _preprocess_for_ocr(img_rgb: np.ndarray) -> np.ndarray:
-    """Light preprocessing: upscale if tiny, mild denoise. EasyOCR prefers colour."""
+_OCR_PROMPT = (
+    "This image is a crop of a title block from an engineering ISO piping drawing. "
+    "Your job is to extract the Circuit ID (sometimes labelled 'Circuit ID', "
+    "'Line No', 'Pipe No', or similar). "
+    "It typically looks like an alphanumeric code such as P-0800-P-2-073 or "
+    "P-2600-P-2-001, possibly handwritten. "
+    "Return ONLY the extracted code — no punctuation, no explanation, nothing else. "
+    "If you see multiple lines, return only the Circuit ID line."
+)
+
+
+def _img_to_b64_png(img_rgb: np.ndarray) -> str:
+    import base64, io
+    pil = Image.fromarray(img_rgb)
+    buf = io.BytesIO()
+    pil.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def _ocr_gpt4o(img_rgb: np.ndarray, api_key: str) -> str:
+    import urllib.request, json as _j
+    payload = _j.dumps({
+        "model": "gpt-4o-mini",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text",       "text": _OCR_PROMPT},
+                {"type": "image_url",  "image_url": {
+                    "url": f"data:image/png;base64,{_img_to_b64_png(img_rgb)}",
+                    "detail": "high"
+                }}
+            ]
+        }],
+        "max_tokens": 60,
+        "temperature": 0
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/chat/completions",
+        data=payload,
+        headers={"Authorization": f"Bearer {api_key}",
+                 "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return _j.loads(r.read())["choices"][0]["message"]["content"].strip()
+
+
+def _ocr_gemini(img_rgb: np.ndarray, api_key: str) -> str:
+    import urllib.request, json as _j
+    url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+           f"gemini-1.5-flash:generateContent?key={api_key}")
+    payload = _j.dumps({
+        "contents": [{"parts": [
+            {"text": _OCR_PROMPT},
+            {"inline_data": {"mime_type": "image/png",
+                             "data": _img_to_b64_png(img_rgb)}}
+        ]}],
+        "generationConfig": {"maxOutputTokens": 60, "temperature": 0}
+    }).encode()
+    req = urllib.request.Request(url, data=payload,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return (_j.loads(r.read())["candidates"][0]
+                ["content"]["parts"][0]["text"].strip())
+
+
+def _ocr_easyocr(img_rgb: np.ndarray) -> str:
+    """EasyOCR local fallback — no API key needed."""
     h, w = img_rgb.shape[:2]
-    # upscale very small crops so the model has enough pixels to work with
     if w < 600:
-        scale = 600 / w
-        img_rgb = cv2.resize(img_rgb,
-                             (int(w * scale), int(h * scale)),
+        img_rgb = cv2.resize(img_rgb, (int(w * 600 / w), int(h * 600 / w)),
                              interpolation=cv2.INTER_CUBIC)
-    # mild denoise without destroying handwriting strokes
-    img_rgb = cv2.fastNlMeansDenoisingColored(img_rgb, None,
-                                              h=7, hColor=7,
-                                              templateWindowSize=7,
-                                              searchWindowSize=21)
-    return img_rgb
+    img_rgb = cv2.fastNlMeansDenoisingColored(img_rgb, None, 7, 7, 7, 21)
+    reader  = get_ocr_reader()
+    results = reader.readtext(img_rgb, detail=1, paragraph=False,
+                              width_ths=0.9, ycenter_ths=0.5)
+    results.sort(key=lambda r: (r[0][0][1], r[0][0][0]))
+    return " ".join(t for _, t, c in results if c > 0.15).strip()
 
 
-def extract_text_from_region(pdf_path: str, roi: dict, page_index: int = 0) -> str:
+def _render_roi(pdf_path: str, roi: dict, page_index: int = 0) -> np.ndarray:
+    """Render the ROI region of a PDF page as an RGB numpy array."""
     doc  = fitz.open(pdf_path)
     page = doc[page_index]
     pw, ph = page.rect.width, page.rect.height
@@ -153,19 +219,32 @@ def extract_text_from_region(pdf_path: str, roi: dict, page_index: int = 0) -> s
     mat  = fitz.Matrix(RENDER_DPI / 72, RENDER_DPI / 72)
     pix  = page.get_pixmap(matrix=mat, clip=clip, colorspace=fitz.csRGB)
     doc.close()
+    return np.frombuffer(pix.samples, dtype=np.uint8).reshape(
+               pix.height, pix.width, 3)
 
-    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
-              pix.height, pix.width, 3)
-    img = _preprocess_for_ocr(img)
 
-    reader  = get_ocr_reader()
-    results = reader.readtext(img, detail=1, paragraph=False,
-                              width_ths=0.9, ycenter_ths=0.5)
+def extract_text_from_region(pdf_path: str, roi: dict, page_index: int = 0) -> str:
+    """Dispatch to the configured OCR engine."""
+    img = _render_roi(pdf_path, roi, page_index)
+    cfg    = load_config()
+    engine = cfg.get("ocr_engine", "easyocr")
 
-    # Sort results top-to-bottom, left-to-right, then join
-    results.sort(key=lambda r: (r[0][0][1], r[0][0][0]))
-    texts = [text for (_, text, conf) in results if conf > 0.15]
-    return " ".join(texts).strip()
+    if engine == "gpt4o":
+        key = cfg.get("openai_key", "").strip()
+        if not key:
+            raise ValueError("GPT-4o selected but no OpenAI API key saved. "
+                             "Open ⚙ OCR Settings to add your key.")
+        return _ocr_gpt4o(img, key)
+
+    if engine == "gemini":
+        key = cfg.get("gemini_key", "").strip()
+        if not key:
+            raise ValueError("Gemini selected but no Google API key saved. "
+                             "Open ⚙ OCR Settings to add your key.")
+        return _ocr_gemini(img, key)
+
+    # default — EasyOCR
+    return _ocr_easyocr(img)
 
 
 def sanitise_filename(raw: str) -> str:
@@ -767,6 +846,133 @@ class ReviewDialog(ctk.CTkToplevel):
 
 
 # ===========================================================================
+# OCR Settings Dialog
+# ===========================================================================
+
+class OCRSettingsDialog(ctk.CTkToplevel):
+    """
+    Let the user pick an OCR engine and enter the API key.
+    Gemini Flash (free) is the default.
+    """
+
+    BG     = "#1a1a2e"
+    PANEL  = "#16213e"
+    ACCENT = "#0f3460"
+    HILIGHT= "#e94560"
+    FG     = "#e0e0e0"
+    FG_DIM = "#9e9e9e"
+
+    ENGINES = [
+        ("gemini",  "🌟  Google Gemini Flash  (FREE — 1,500 pages/day)"),
+        ("gpt4o",   "🔵  OpenAI GPT-4o mini   (≈ $0.001 / page)"),
+        ("easyocr", "💻  EasyOCR Local        (no key needed — less accurate)"),
+    ]
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("OCR Engine Settings")
+        self.geometry("600x480")
+        self.resizable(False, False)
+        self.configure(fg_color=self.BG)
+        self.grab_set()
+
+        cfg = load_config()
+        self._engine_var  = tk.StringVar(value=cfg.get("ocr_engine", "gemini"))
+        self._gemini_var  = tk.StringVar(value=cfg.get("gemini_key", ""))
+        self._openai_var  = tk.StringVar(value=cfg.get("openai_key", ""))
+
+        self._build_ui()
+        self._on_engine_change()   # show/hide correct key field
+
+    def _build_ui(self):
+        pad = {"padx": 24, "pady": 6}
+
+        ctk.CTkLabel(self, text="OCR Engine Settings",
+                     font=ctk.CTkFont(size=16, weight="bold"),
+                     text_color=self.HILIGHT
+                     ).pack(anchor="w", padx=24, pady=(20, 4))
+
+        ctk.CTkLabel(self,
+            text="Choose how Circuit IDs are read from your drawings.",
+            font=ctk.CTkFont(size=11), text_color=self.FG_DIM
+        ).pack(anchor="w", padx=24, pady=(0, 14))
+
+        # ── engine radio buttons ──────────────────────────────────────
+        for value, label in self.ENGINES:
+            ctk.CTkRadioButton(self, text=label,
+                               variable=self._engine_var, value=value,
+                               font=ctk.CTkFont(size=12),
+                               text_color=self.FG,
+                               fg_color=self.HILIGHT,
+                               hover_color="#c73652",
+                               command=self._on_engine_change
+                               ).pack(anchor="w", **pad)
+
+        # ── Gemini key row ────────────────────────────────────────────
+        self._gemini_frame = ctk.CTkFrame(self, fg_color=self.PANEL, corner_radius=8)
+        self._gemini_frame.pack(fill="x", padx=24, pady=(10, 0))
+
+        ctk.CTkLabel(self._gemini_frame,
+            text="Google API Key   (free at  aistudio.google.com/app/apikey)",
+            font=ctk.CTkFont(size=11), text_color=self.FG_DIM
+        ).pack(anchor="w", padx=12, pady=(10, 2))
+
+        ctk.CTkEntry(self._gemini_frame, textvariable=self._gemini_var,
+                     placeholder_text="Paste your Google API key here…",
+                     show="•", width=540, height=32,
+                     font=ctk.CTkFont(size=12),
+                     fg_color=self.ACCENT, text_color=self.FG,
+                     border_color=self.ACCENT
+                     ).pack(padx=12, pady=(0, 10))
+
+        # ── OpenAI key row ────────────────────────────────────────────
+        self._openai_frame = ctk.CTkFrame(self, fg_color=self.PANEL, corner_radius=8)
+        self._openai_frame.pack(fill="x", padx=24, pady=(10, 0))
+
+        ctk.CTkLabel(self._openai_frame,
+            text="OpenAI API Key   (platform.openai.com/api-keys)",
+            font=ctk.CTkFont(size=11), text_color=self.FG_DIM
+        ).pack(anchor="w", padx=12, pady=(10, 2))
+
+        ctk.CTkEntry(self._openai_frame, textvariable=self._openai_var,
+                     placeholder_text="Paste your OpenAI API key here…",
+                     show="•", width=540, height=32,
+                     font=ctk.CTkFont(size=12),
+                     fg_color=self.ACCENT, text_color=self.FG,
+                     border_color=self.ACCENT
+                     ).pack(padx=12, pady=(0, 10))
+
+        # ── save button ───────────────────────────────────────────────
+        ctk.CTkButton(self, text="Save & Close",
+                      fg_color=self.HILIGHT, hover_color="#c73652",
+                      width=160, height=36,
+                      font=ctk.CTkFont(size=13, weight="bold"),
+                      command=self._save
+                      ).pack(pady=20)
+
+    def _on_engine_change(self):
+        eng = self._engine_var.get()
+        # Show/hide the relevant key frame
+        if eng == "gemini":
+            self._gemini_frame.pack(fill="x", padx=24, pady=(10, 0))
+            self._openai_frame.pack_forget()
+        elif eng == "gpt4o":
+            self._gemini_frame.pack_forget()
+            self._openai_frame.pack(fill="x", padx=24, pady=(10, 0))
+        else:
+            self._gemini_frame.pack_forget()
+            self._openai_frame.pack_forget()
+
+    def _save(self):
+        cfg = load_config()
+        cfg["ocr_engine"] = self._engine_var.get()
+        cfg["gemini_key"] = self._gemini_var.get().strip()
+        cfg["openai_key"] = self._openai_var.get().strip()
+        save_config(cfg)
+        self.destroy()
+
+
+# ===========================================================================
 # Main Application
 # ===========================================================================
 
@@ -800,8 +1006,18 @@ class PDFRenamerApp:
         self.roi: dict = cfg.get("roi", dict(DEFAULT_ROI))
 
         self._build_ui()
-        self._log("ROI loaded from saved config." if "roi" in cfg else
-                  "Using default ROI — click 'Set ROI' to configure.", "info")
+        if "roi" in cfg:
+            self._log("ROI loaded from saved config.", "info")
+        else:
+            self._log("Using default ROI — click '🗺 Set ROI' to configure.", "info")
+        engine = cfg.get("ocr_engine", "gemini")
+        if engine in ("gemini", "gpt4o"):
+            key_name = "gemini_key" if engine == "gemini" else "openai_key"
+            if not cfg.get(key_name, "").strip():
+                self._log(
+                    f"No API key set — click '⚙ OCR' and paste your "
+                    f"{'Google' if engine == 'gemini' else 'OpenAI'} API key to get started.",
+                    "warning")
 
     # ------------------------------------------------------------------
     # UI construction
@@ -929,11 +1145,17 @@ class PDFRenamerApp:
             font=ctk.CTkFont(size=10), text_color=self.FG_DIM)
         self.roi_lbl.grid(row=0, column=3, sticky="e", padx=(0, 6))
 
-        ctk.CTkButton(row, text="🗺  Set ROI", width=120, height=28,
+        ctk.CTkButton(row, text="🗺  Set ROI", width=110, height=28,
             font=ctk.CTkFont(size=11),
             fg_color=self.HILIGHT, hover_color="#c73652", corner_radius=6,
             command=self._open_roi_editor
-        ).grid(row=0, column=4)
+        ).grid(row=0, column=4, padx=(0, 6))
+
+        ctk.CTkButton(row, text="⚙  OCR", width=90, height=28,
+            font=ctk.CTkFont(size=11),
+            fg_color="#2a5298", hover_color="#1e3f7a", corner_radius=6,
+            command=self._open_ocr_settings
+        ).grid(row=0, column=5)
 
     def _build_file_list(self, parent):
         fl = ctk.CTkFrame(parent, fg_color="transparent")
@@ -954,15 +1176,47 @@ class PDFRenamerApp:
         self.file_listbox.configure(yscrollcommand=sb.set)
 
     # ------------------------------------------------------------------
-    # OCR-ready polling
+    # OCR-ready polling / status
     # ------------------------------------------------------------------
 
+    def _engine_label(self) -> str:
+        e = load_config().get("ocr_engine", "gemini")
+        return {"gemini": "Gemini Flash", "gpt4o": "GPT-4o mini",
+                "easyocr": "EasyOCR (local)"}.get(e, e)
+
     def _poll_ocr_ready(self):
-        if _ocr_init_event.is_set():
-            self.ocr_status_lbl.configure(
-                text="✔ OCR model ready", text_color=self.SUCCESS)
+        cfg = load_config()
+        engine = cfg.get("ocr_engine", "gemini")
+
+        if engine in ("gemini", "gpt4o"):
+            # Cloud engine — no local model needed
+            key = cfg.get("gemini_key" if engine == "gemini" else "openai_key", "")
+            if key:
+                self.ocr_status_lbl.configure(
+                    text=f"✔ {self._engine_label()} ready",
+                    text_color=self.SUCCESS)
+            else:
+                self.ocr_status_lbl.configure(
+                    text=f"⚠ {self._engine_label()} — no API key  (click ⚙ OCR)",
+                    text_color=self.WARNING)
         else:
-            self.root.after(500, self._poll_ocr_ready)
+            if _ocr_init_event.is_set():
+                self.ocr_status_lbl.configure(
+                    text="✔ EasyOCR model ready", text_color=self.SUCCESS)
+            else:
+                self.ocr_status_lbl.configure(
+                    text="⏳ Loading EasyOCR model…", text_color=self.WARNING)
+                self.root.after(500, self._poll_ocr_ready)
+
+    def _open_ocr_settings(self):
+        dlg = OCRSettingsDialog(self.root)
+        self.root.wait_window(dlg)
+        # Restart EasyOCR warmup if user switched to it
+        cfg = load_config()
+        if cfg.get("ocr_engine") == "easyocr" and not _ocr_init_event.is_set():
+            threading.Thread(target=_init_reader_bg, daemon=True).start()
+        self._poll_ocr_ready()
+        self._log(f"OCR engine set to: {self._engine_label()}", "info")
 
     # ------------------------------------------------------------------
     # File management
