@@ -226,13 +226,13 @@ def _ocr_gpt4o(img_rgb: np.ndarray, api_key: str) -> str:
         return _j.loads(r.read())["choices"][0]["message"]["content"].strip()
 
 
-_gemini_lock          = threading.Lock()
-_gemini_last_call_ts  = 0.0   # epoch seconds of last successful send
-_GEMINI_MIN_INTERVAL  = 5.0   # seconds between calls
-_gemini_endpoint_cache = None  # full URL (without key) that worked last time
+_gemini_lock           = threading.Lock()
+_gemini_last_call_ts   = 0.0
+_GEMINI_MIN_INTERVAL   = 5.0   # seconds between calls
+_gemini_endpoint_cache = None  # base URL that worked last time
 
-# Try every reasonable (api_version, model) combination in order.
-# We try v1 first (stable), then v1beta.  Best/newest models first.
+# v1 (stable) first, then v1beta.  Each endpoint tested with a lightweight
+# probe; the first that responds (even 429) is used for real calls.
 _GEMINI_ENDPOINT_CANDIDATES = [
     "https://generativelanguage.googleapis.com/v1/models/gemini-2.0-flash:generateContent",
     "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent",
@@ -242,8 +242,26 @@ _GEMINI_ENDPOINT_CANDIDATES = [
     "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent",
 ]
 
+def _gemini_request(base_url: str, api_key: str, payload_bytes: bytes):
+    """Make one HTTP request; return response text or raise HTTPError."""
+    import urllib.request, urllib.error
+    req = urllib.request.Request(
+        f"{base_url}?key={api_key}",
+        data=payload_bytes,
+        headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        import json as _j
+        return (_j.loads(r.read())["candidates"][0]
+                ["content"]["parts"][0]["text"].strip())
+
+def _read_http_body(e) -> str:
+    try:
+        return e.read().decode(errors="replace")[:300]
+    except Exception:
+        return ""
+
 def _ocr_gemini(img_rgb: np.ndarray, api_key: str) -> str:
-    import urllib.request, urllib.error, json as _j, time
+    import urllib.error, json as _j, time
 
     global _gemini_last_call_ts, _gemini_endpoint_cache
 
@@ -264,49 +282,60 @@ def _ocr_gemini(img_rgb: np.ndarray, api_key: str) -> str:
     }
 
     with _gemini_lock:
+        # ── Step 1: enforce minimum gap between calls ────────────────────
         gap = time.time() - _gemini_last_call_ts
         if gap < _GEMINI_MIN_INTERVAL:
             time.sleep(_GEMINI_MIN_INTERVAL - gap)
 
-        endpoints = ([_gemini_endpoint_cache] if _gemini_endpoint_cache
-                     else _GEMINI_ENDPOINT_CANDIDATES)
+        payload = _j.dumps(payload_obj).encode()
 
-        errors = []
-        for base_url in endpoints:
-            url     = f"{base_url}?key={api_key}"
-            payload = _j.dumps(payload_obj).encode()   # fresh bytes each attempt
-            req     = urllib.request.Request(
-                url, data=payload,
-                headers={"Content-Type": "application/json"})
-
-            for wait in [10, 30, 60, None]:   # 429 back-off retries
+        # ── Step 2: discover working endpoint if not yet cached ──────────
+        if not _gemini_endpoint_cache:
+            for base_url in _GEMINI_ENDPOINT_CANDIDATES:
                 try:
-                    with urllib.request.urlopen(req, timeout=30) as r:
-                        _gemini_last_call_ts   = time.time()
-                        _gemini_endpoint_cache = base_url
-                        return (_j.loads(r.read())["candidates"][0]
-                                ["content"]["parts"][0]["text"].strip())
+                    result = _gemini_request(base_url, api_key, payload)
+                    _gemini_last_call_ts   = time.time()
+                    _gemini_endpoint_cache = base_url
+                    return result
                 except urllib.error.HTTPError as e:
-                    body = ""
-                    try:
-                        body = e.read().decode(errors="replace")[:200]
-                    except Exception:
-                        pass
-                    if e.code == 429 and wait is not None:
-                        time.sleep(wait)
-                        continue
-                    if e.code in (404, 400):
-                        errors.append(f"{base_url.split('/models/')[1]}: "
-                                      f"HTTP {e.code} — {body}")
-                        break   # skip to next endpoint
+                    body = _read_http_body(e)
+                    if e.code == 429:
+                        # This endpoint EXISTS and our key is valid — use it.
+                        # Fall through to Step 3 with this endpoint.
+                        _gemini_endpoint_cache = base_url
+                        break
+                    if e.code in (400, 404):
+                        continue   # endpoint/model doesn't exist — try next
                     raise urllib.error.HTTPError(
-                        e.url, e.code, f"{e.reason} | {body}",
-                        e.headers, None)
+                        e.url, e.code, f"{e.reason}: {body}", e.headers, None)
 
-        raise RuntimeError(
-            "No working Gemini endpoint found.\n"
-            "Tried:\n" + "\n".join(f"  • {e}" for e in errors)
-        )
+        # ── Step 3: call the confirmed endpoint, retry once on 429 ───────
+        if not _gemini_endpoint_cache:
+            raise RuntimeError(
+                "Could not reach any Gemini endpoint. "
+                "Check your API key and internet connection.")
+
+        payload = _j.dumps(payload_obj).encode()   # fresh bytes
+        for attempt in range(3):
+            try:
+                result = _gemini_request(_gemini_endpoint_cache, api_key, payload)
+                _gemini_last_call_ts = time.time()
+                return result
+            except urllib.error.HTTPError as e:
+                body = _read_http_body(e)
+                if e.code == 429:
+                    if attempt < 2:
+                        wait = 15 * (attempt + 1)   # 15s, 30s
+                        time.sleep(wait)
+                        payload = _j.dumps(payload_obj).encode()
+                        continue
+                    raise RuntimeError(
+                        "Google API rate limit hit (429). "
+                        "You may have used your daily quota (1,500 req/day free). "
+                        "Wait a minute and try again, or check "
+                        "https://aistudio.google.com for your usage.")
+                raise urllib.error.HTTPError(
+                    e.url, e.code, f"{e.reason}: {body}", e.headers, None)
 
 
 def _ocr_easyocr(img_rgb: np.ndarray) -> str:
