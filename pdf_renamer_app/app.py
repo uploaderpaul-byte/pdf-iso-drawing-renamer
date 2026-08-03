@@ -101,6 +101,47 @@ def get_ocr_reader() -> easyocr.Reader:
 threading.Thread(target=_init_reader_bg, daemon=True).start()
 
 # ---------------------------------------------------------------------------
+# Copy / Paste context menu helper
+# ---------------------------------------------------------------------------
+
+def _bind_context_menu(widget):
+    """
+    Attach a right-click Cut / Copy / Paste / Select All menu to any
+    tk.Entry or ctk.CTkEntry widget.  Also ensures Ctrl+A selects all.
+    Works on Windows, macOS, and Linux.
+    """
+    # CTkEntry wraps a plain tk.Entry accessible via ._entry
+    target = getattr(widget, "_entry", widget)
+
+    menu = tk.Menu(target, tearoff=0,
+                   bg="#1a1a1a", fg="#ffffff",
+                   activebackground="#cc0000", activeforeground="#ffffff",
+                   relief="flat", bd=1, font=("Segoe UI", 10))
+    menu.add_command(label="Cut",
+                     command=lambda: target.event_generate("<<Cut>>"))
+    menu.add_command(label="Copy",
+                     command=lambda: target.event_generate("<<Copy>>"))
+    menu.add_command(label="Paste",
+                     command=lambda: target.event_generate("<<Paste>>"))
+    menu.add_separator()
+    menu.add_command(label="Select All",
+                     command=lambda: target.event_generate("<<SelectAll>>"))
+
+    def _show(event):
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _select_all(event):
+        target.event_generate("<<SelectAll>>")
+        return "break"
+
+    target.bind("<Button-3>",  _show)          # right-click
+    target.bind("<Control-a>", _select_all)     # Ctrl+A
+    target.bind("<Control-A>", _select_all)     # Ctrl+Shift+A (caps lock)
+
+# ---------------------------------------------------------------------------
 # Config persistence  (~/.pdf_circ_id_extractor.json)
 # ---------------------------------------------------------------------------
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".pdf_circ_id_extractor.json")
@@ -339,7 +380,7 @@ class InteractiveROIDialog(ctk.CTkToplevel):
         super().__init__(parent)
         self.title("Set ROI — Drag a box over the title block, then click Apply")
         self.resizable(True, True)
-        self.configure(fg_color="#1a1a2e")
+        self.configure(fg_color="#0d0d0d")
         self.grab_set()
 
         self.pdf_path    = pdf_path
@@ -385,11 +426,11 @@ class InteractiveROIDialog(ctk.CTkToplevel):
         self.geometry(f"{self.disp_w + 30}x{self.disp_h + 140}")
 
         # ── canvas ───────────────────────────────────────────────────
-        canvas_frame = tk.Frame(self, bg="#1a1a2e")
+        canvas_frame = tk.Frame(self, bg="#0d0d0d")
         canvas_frame.pack(fill="both", expand=True, padx=10, pady=(10, 4))
 
         self.canvas = tk.Canvas(canvas_frame, width=self.disp_w, height=self.disp_h,
-                                cursor="crosshair", bg="#1a1a2e",
+                                cursor="crosshair", bg="#0d0d0d",
                                 highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
 
@@ -407,7 +448,7 @@ class InteractiveROIDialog(ctk.CTkToplevel):
         self._status_var = tk.StringVar(
             value="Drag to draw a new ROI  ·  or use Auto-Detect  ·  then click Apply")
         status_lbl = ctk.CTkLabel(self, textvariable=self._status_var,
-                                  font=ctk.CTkFont(size=11), text_color="#9e9e9e")
+                                  font=ctk.CTkFont(size=11), text_color="#aaaaaa")
         status_lbl.pack(pady=(2, 4))
 
         # ── button row ───────────────────────────────────────────────
@@ -415,19 +456,19 @@ class InteractiveROIDialog(ctk.CTkToplevel):
         btn_row.pack(pady=(0, 10))
 
         ctk.CTkButton(btn_row, text="🔍  Auto-Detect Title Block",
-                      fg_color="#2a5298", hover_color="#1e3f7a", width=200, height=32,
+                      fg_color="#330000", hover_color="#4d0000", width=200, height=32,
                       command=self._auto_detect).pack(side="left", padx=6)
 
         ctk.CTkButton(btn_row, text="🧪  Test OCR",
-                      fg_color="#1a4a80", hover_color="#0f3460", width=120, height=32,
+                      fg_color="#330000", hover_color="#4d0000", width=120, height=32,
                       command=self._test_ocr).pack(side="left", padx=6)
 
         ctk.CTkButton(btn_row, text="✔  Apply",
-                      fg_color="#e94560", hover_color="#c73652", width=100, height=32,
+                      fg_color="#cc0000", hover_color="#aa0000", width=100, height=32,
                       command=self._apply).pack(side="left", padx=6)
 
         ctk.CTkButton(btn_row, text="Cancel",
-                      fg_color="#2d2d4e", hover_color="#3d3d5e", width=80, height=32,
+                      fg_color="#1a1a1a", hover_color="#2a2a2a", width=80, height=32,
                       command=self.destroy).pack(side="left", padx=6)
 
     # ------------------------------------------------------------------
@@ -465,14 +506,14 @@ class InteractiveROIDialog(ctk.CTkToplevel):
         # Semi-transparent overlay on the rest of the page
         # (tk Canvas doesn't support alpha natively, so we draw a dashed rect)
         self.canvas.create_rectangle(x0, y0, x1, y1,
-                                     outline="#e94560", width=3,
+                                     outline="#cc0000", width=3,
                                      dash=(10, 5), tags="roi")
 
         # Corner handles
         for hx, hy, tag in [(x0, y0, "h_tl"), (x1, y0, "h_tr"),
                              (x0, y1, "h_bl"), (x1, y1, "h_br")]:
             self.canvas.create_oval(hx-hr, hy-hr, hx+hr, hy+hr,
-                                    fill="#e94560", outline="#ffffff", width=1,
+                                    fill="#cc0000", outline="#ffffff", width=1,
                                     tags=("roi", tag))
 
         self._update_status()
@@ -607,16 +648,16 @@ class ReviewDialog(ctk.CTkToplevel):
     self.approved_items is set to a list of dicts on approval, or None on cancel.
     """
 
-    BG      = "#1a1a2e"
-    PANEL   = "#16213e"
-    ACCENT  = "#0f3460"
-    HILIGHT = "#e94560"
-    FG      = "#e0e0e0"
-    FG_DIM  = "#9e9e9e"
-    OK_BG   = "#1a3a1a"
-    FAIL_BG = "#3a1a1a"
-    OK_FG   = "#4caf50"
-    FAIL_FG = "#ff9800"
+    BG      = "#0d0d0d"
+    PANEL   = "#1a1a1a"
+    ACCENT  = "#2d0000"
+    HILIGHT = "#cc0000"
+    FG      = "#ffffff"
+    FG_DIM  = "#aaaaaa"
+    OK_BG   = "#001400"
+    FAIL_BG = "#1a0000"
+    OK_FG   = "#00cc44"
+    FAIL_FG = "#ff8800"
 
     def __init__(self, parent, results: list):
         super().__init__(parent)
@@ -756,9 +797,10 @@ class ReviewDialog(ctk.CTkToplevel):
                              bg=self.ACCENT, fg=self.FG,
                              insertbackground=self.FG,
                              relief="flat", font=("Consolas", 10),
-                             disabledbackground="#1a1a2e",
+                             disabledbackground="#0d0d0d",
                              disabledforeground="#555555")
             entry.grid(row=0, column=3, sticky="ew", padx=(0, 8), ipady=4)
+            _bind_context_menu(entry)
 
             # disable entry when skip is ticked
             def _toggle_entry(e=entry, v=skip_var):
@@ -855,12 +897,12 @@ class OCRSettingsDialog(ctk.CTkToplevel):
     Gemini Flash (free) is the default.
     """
 
-    BG     = "#1a1a2e"
-    PANEL  = "#16213e"
-    ACCENT = "#0f3460"
-    HILIGHT= "#e94560"
-    FG     = "#e0e0e0"
-    FG_DIM = "#9e9e9e"
+    BG     = "#0d0d0d"
+    PANEL  = "#1a1a1a"
+    ACCENT = "#2d0000"
+    HILIGHT= "#cc0000"
+    FG     = "#ffffff"
+    FG_DIM = "#aaaaaa"
 
     ENGINES = [
         ("gemini",  "🌟  Google Gemini Flash  (FREE — 1,500 pages/day)"),
@@ -917,13 +959,14 @@ class OCRSettingsDialog(ctk.CTkToplevel):
             font=ctk.CTkFont(size=11), text_color=self.FG_DIM
         ).pack(anchor="w", padx=12, pady=(10, 2))
 
-        ctk.CTkEntry(self._gemini_frame, textvariable=self._gemini_var,
+        _gemini_entry = ctk.CTkEntry(self._gemini_frame, textvariable=self._gemini_var,
                      placeholder_text="Paste your Google API key here…",
                      show="•", width=540, height=32,
                      font=ctk.CTkFont(size=12),
                      fg_color=self.ACCENT, text_color=self.FG,
-                     border_color=self.ACCENT
-                     ).pack(padx=12, pady=(0, 10))
+                     border_color=self.ACCENT)
+        _gemini_entry.pack(padx=12, pady=(0, 10))
+        _bind_context_menu(_gemini_entry)
 
         # ── OpenAI key row ────────────────────────────────────────────
         self._openai_frame = ctk.CTkFrame(self, fg_color=self.PANEL, corner_radius=8)
@@ -934,13 +977,14 @@ class OCRSettingsDialog(ctk.CTkToplevel):
             font=ctk.CTkFont(size=11), text_color=self.FG_DIM
         ).pack(anchor="w", padx=12, pady=(10, 2))
 
-        ctk.CTkEntry(self._openai_frame, textvariable=self._openai_var,
+        _openai_entry = ctk.CTkEntry(self._openai_frame, textvariable=self._openai_var,
                      placeholder_text="Paste your OpenAI API key here…",
                      show="•", width=540, height=32,
                      font=ctk.CTkFont(size=12),
                      fg_color=self.ACCENT, text_color=self.FG,
-                     border_color=self.ACCENT
-                     ).pack(padx=12, pady=(0, 10))
+                     border_color=self.ACCENT)
+        _openai_entry.pack(padx=12, pady=(0, 10))
+        _bind_context_menu(_openai_entry)
 
         # ── save button ───────────────────────────────────────────────
         ctk.CTkButton(self, text="Save & Close",
@@ -977,15 +1021,15 @@ class OCRSettingsDialog(ctk.CTkToplevel):
 # ===========================================================================
 
 class PDFRenamerApp:
-    BG      = "#1a1a2e"
-    PANEL   = "#16213e"
-    ACCENT  = "#0f3460"
-    HILIGHT = "#e94560"
-    FG      = "#e0e0e0"
-    FG_DIM  = "#9e9e9e"
-    SUCCESS = "#4caf50"
-    WARNING = "#ff9800"
-    ERROR   = "#f44336"
+    BG      = "#0d0d0d"
+    PANEL   = "#1a1a1a"
+    ACCENT  = "#2d0000"
+    HILIGHT = "#cc0000"
+    FG      = "#ffffff"
+    FG_DIM  = "#aaaaaa"
+    SUCCESS = "#00cc44"
+    WARNING = "#ff8800"
+    ERROR   = "#ff3333"
 
     def __init__(self):
         ctk.set_appearance_mode("dark")
@@ -1128,11 +1172,12 @@ class PDFRenamerApp:
                      font=ctk.CTkFont(size=11)).grid(row=0, column=0, sticky="w")
 
         self.out_dir_var = tk.StringVar(value="(same folder as input PDFs)")
-        ctk.CTkEntry(row, textvariable=self.out_dir_var,
+        _out_entry = ctk.CTkEntry(row, textvariable=self.out_dir_var,
                      font=ctk.CTkFont(size=11),
                      fg_color=self.ACCENT, text_color=self.FG,
-                     border_color=self.ACCENT, height=28
-                     ).grid(row=0, column=1, sticky="ew", padx=6)
+                     border_color=self.ACCENT, height=28)
+        _out_entry.grid(row=0, column=1, sticky="ew", padx=6)
+        _bind_context_menu(_out_entry)
 
         ctk.CTkButton(row, text="Browse", width=70, height=28,
             font=ctk.CTkFont(size=11),
