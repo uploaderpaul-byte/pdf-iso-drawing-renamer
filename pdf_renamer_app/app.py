@@ -1353,6 +1353,10 @@ class PDFRenamerApp:
     # ------------------------------------------------------------------
 
     def _log(self, msg: str, level: str = "info"):
+        # Tkinter is not thread-safe — always run widget ops on the main thread.
+        if threading.current_thread() is not threading.main_thread():
+            self.root.after(0, self._log, msg, level)
+            return
         colours  = {"info": self.FG, "success": self.SUCCESS,
                     "warning": self.WARNING, "error": self.ERROR}
         prefixes = {"info": "  ", "success": "✔ ", "warning": "⚠ ", "error": "✖ "}
