@@ -398,18 +398,47 @@ def _ocr_openrouter(img_rgb: np.ndarray, api_key: str) -> str:
     raise RuntimeError(f"All OpenRouter models failed. Last error: {last_err}")
 
 
-def _ocr_easyocr(img_rgb: np.ndarray) -> str:
-    """EasyOCR local fallback — no API key needed."""
+def _preprocess_for_ocr(img_rgb: np.ndarray) -> np.ndarray:
+    """Preprocess an engineering-drawing crop for best OCR accuracy."""
+    # 1. Upscale aggressively — target ≥ 1600 px wide
     h, w = img_rgb.shape[:2]
-    if w < 600:
-        img_rgb = cv2.resize(img_rgb, (int(w * 600 / w), int(h * 600 / w)),
+    if w < 1600:
+        scale  = 1600 / w
+        img_rgb = cv2.resize(img_rgb, (int(w * scale), int(h * scale)),
                              interpolation=cv2.INTER_CUBIC)
-    img_rgb = cv2.fastNlMeansDenoisingColored(img_rgb, None, 7, 7, 7, 21)
-    reader  = get_ocr_reader()
-    results = reader.readtext(img_rgb, detail=1, paragraph=False,
-                              width_ths=0.9, ycenter_ths=0.5)
+    # 2. Convert to grayscale
+    gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+    # 3. Sharpen
+    kernel  = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
+    gray    = cv2.filter2D(gray, -1, kernel)
+    # 4. CLAHE for local contrast (makes faint pencil marks visible)
+    clahe   = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    gray    = clahe.apply(gray)
+    # 5. Adaptive threshold → crisp black-on-white
+    binary  = cv2.adaptiveThreshold(gray, 255,
+                                    cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                    cv2.THRESH_BINARY, 31, 10)
+    # 6. Denoise
+    binary  = cv2.medianBlur(binary, 3)
+    # Return as RGB (EasyOCR accepts colour arrays)
+    return cv2.cvtColor(binary, cv2.COLOR_GRAY2RGB)
+
+
+def _ocr_easyocr(img_rgb: np.ndarray) -> str:
+    """Local OCR using EasyOCR — no internet or API key needed."""
+    processed = _preprocess_for_ocr(img_rgb)
+    reader    = get_ocr_reader()
+    results   = reader.readtext(processed, detail=1, paragraph=False,
+                                width_ths=0.7, ycenter_ths=0.5)
     results.sort(key=lambda r: (r[0][0][1], r[0][0][0]))
-    return " ".join(t for _, t, c in results if c > 0.15).strip()
+    # Collect all tokens with confidence > 0.1
+    tokens = [t for _, t, c in results if c > 0.10]
+    full   = " ".join(tokens).strip()
+    # Try to pick the token that looks most like a Circuit ID
+    for tok in tokens:
+        if re.search(r'[A-Z0-9]{1,6}-[A-Z0-9]', tok.upper()):
+            return tok.strip()
+    return full
 
 
 def _render_roi(pdf_path: str, roi: dict, page_index: int = 0) -> np.ndarray:
@@ -426,34 +455,59 @@ def _render_roi(pdf_path: str, roi: dict, page_index: int = 0) -> np.ndarray:
                pix.height, pix.width, 3)
 
 
+def _extract_embedded_text(pdf_path: str, roi: dict, page_index: int = 0) -> str:
+    """Pull text directly embedded in the PDF — instant, no OCR needed."""
+    try:
+        doc  = fitz.open(pdf_path)
+        page = doc[page_index]
+        pw, ph = page.rect.width, page.rect.height
+        clip = fitz.Rect(roi["left"]*pw, roi["top"]*ph,
+                         roi["right"]*pw, roi["bottom"]*ph)
+        text = page.get_text("text", clip=clip).strip()
+        doc.close()
+        # Only return if it looks like a circuit-ID code (letters+numbers+hyphens)
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        for line in lines:
+            if re.search(r'[A-Z0-9]{1,6}-[A-Z0-9]', line.upper()):
+                return line
+    except Exception:
+        pass
+    return ""
+
+
 def extract_text_from_region(pdf_path: str, roi: dict, page_index: int = 0) -> str:
     """Dispatch to the configured OCR engine."""
-    img    = _render_roi(pdf_path, roi, page_index)
     cfg    = load_config()
-    engine = cfg.get("ocr_engine", "openrouter")
+    engine = cfg.get("ocr_engine", "easyocr")
+
+    # ── Always try embedded PDF text first (instant, works for CAD-drawn PDFs) ──
+    embedded = _extract_embedded_text(pdf_path, roi)
+    if embedded:
+        return embedded
+
+    # ── Render the ROI to an image for pixel-based OCR ──────────────────────────
+    img = _render_roi(pdf_path, roi)
 
     if engine == "openrouter":
         key = cfg.get("openrouter_key", "").strip()
         if not key:
             raise ValueError("OpenRouter selected but no API key saved. "
-                             "Open ⚙ OCR Settings to add your free key from openrouter.ai")
+                             "Open ⚙ OCR Settings → paste your free key from openrouter.ai")
         return _ocr_openrouter(img, key)
 
     if engine == "gpt4o":
         key = cfg.get("openai_key", "").strip()
         if not key:
-            raise ValueError("GPT-4o selected but no OpenAI API key saved. "
-                             "Open ⚙ OCR Settings to add your key.")
+            raise ValueError("GPT-4o selected but no OpenAI API key saved.")
         return _ocr_gpt4o(img, key)
 
     if engine == "gemini":
         key = cfg.get("gemini_key", "").strip()
         if not key:
-            raise ValueError("Gemini selected but no Google API key saved. "
-                             "Open ⚙ OCR Settings to add your key.")
+            raise ValueError("Gemini selected but no Google API key saved.")
         return _ocr_gemini(img, key)
 
-    # default — EasyOCR local
+    # default — EasyOCR (local, no internet needed)
     return _ocr_easyocr(img)
 
 
@@ -1080,10 +1134,10 @@ class OCRSettingsDialog(ctk.CTkToplevel):
     FG_DIM = "#aaaaaa"
 
     ENGINES = [
-        ("openrouter", "🌟  OpenRouter  (FREE — best handwriting, no rate limits)"),
+        ("easyocr",    "💻  EasyOCR Local   (DEFAULT — no key, no internet, works offline)"),
+        ("openrouter", "🌟  OpenRouter AI   (FREE key — better on messy handwriting)"),
         ("gpt4o",      "🔵  OpenAI GPT-4o mini   (≈ $0.001 / page)"),
-        ("gemini",     "🔴  Google Gemini  (unreliable free tier — not recommended)"),
-        ("easyocr",    "💻  EasyOCR Local  (no key needed — less accurate)"),
+        ("gemini",     "🔴  Google Gemini   (not recommended — unreliable)"),
     ]
 
     def __init__(self, parent):
@@ -1095,7 +1149,7 @@ class OCRSettingsDialog(ctk.CTkToplevel):
         self.grab_set()
 
         cfg = load_config()
-        self._engine_var      = tk.StringVar(value=cfg.get("ocr_engine", "openrouter"))
+        self._engine_var      = tk.StringVar(value=cfg.get("ocr_engine", "easyocr"))
         self._openrouter_var  = tk.StringVar(value=cfg.get("openrouter_key", ""))
         self._gemini_var      = tk.StringVar(value=cfg.get("gemini_key", ""))
         self._openai_var      = tk.StringVar(value=cfg.get("openai_key", ""))
@@ -1247,7 +1301,7 @@ class PDFRenamerApp:
             self._log("ROI loaded from saved config.", "info")
         else:
             self._log("Using default ROI — click '🗺 Set ROI' to configure.", "info")
-        engine = cfg.get("ocr_engine", "openrouter")
+        engine = cfg.get("ocr_engine", "easyocr")
         key_map = {"openrouter": "openrouter_key", "gemini": "gemini_key",
                    "gpt4o": "openai_key"}
         if engine in key_map:
@@ -1420,7 +1474,7 @@ class PDFRenamerApp:
     # ------------------------------------------------------------------
 
     def _engine_label(self) -> str:
-        e = load_config().get("ocr_engine", "openrouter")
+        e = load_config().get("ocr_engine", "easyocr")
         return {"openrouter": "OpenRouter (Qwen2.5-VL)", "gemini": "Gemini Flash",
                 "gpt4o": "GPT-4o mini", "easyocr": "EasyOCR (local)"}.get(e, e)
 
