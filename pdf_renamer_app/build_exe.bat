@@ -1,10 +1,14 @@
 @echo off
 REM ============================================================
-REM  PDF Circuit ID Extractor — Self-Contained Build Script v6
+REM  PDF Circuit ID Extractor — Self-Contained Build Script v7
 REM  Only needs app.py in the same folder. No other files needed.
-REM  NOTE: Uses --onedir (not --onefile) because EasyOCR/PyTorch
-REM        are too large for a single-file bundle.
-REM  The finished app will be in:  dist\PDF_Circ_ID_Extractor\
+REM
+REM  Default OCR engine: Google Gemini Flash (FREE).
+REM  EasyOCR is also installed as a local fallback.
+REM
+REM  NOTE: Uses --onedir because EasyOCR/PyTorch are too large
+REM        for a single-file bundle.
+REM  Finished app: dist\PDF_Circ_ID_Extractor\PDF_Circ_ID_Extractor.exe
 REM ============================================================
 cd /d "%~dp0"
 
@@ -25,7 +29,7 @@ for /f "tokens=*" %%v in ('python --version 2^>^&1') do echo Python: %%v
 
 REM ── Install dependencies ────────────────────────────────────
 echo.
-echo [1/3] Installing dependencies (easyocr download may take a moment)...
+echo [1/3] Installing dependencies...
 python -m pip install --upgrade pip --quiet
 python -m pip install customtkinter Pillow PyMuPDF easyocr opencv-python numpy
 if errorlevel 1 (
@@ -42,11 +46,7 @@ if errorlevel 1 (
     pause & exit /b 1
 )
 
-REM ── Build the app folder ─────────────────────────────────────
-REM  --onedir is used because EasyOCR bundles PyTorch which is
-REM  ~1-2 GB — onefile would work but extraction on every launch
-REM  would be very slow.  onedir creates a folder you can zip
-REM  and share, with PDF_Circ_ID_Extractor.exe inside.
+REM ── Build the app ────────────────────────────────────────────
 echo.
 echo [3/3] Building app (takes 3-8 minutes, please wait)...
 python -m PyInstaller ^
@@ -70,12 +70,17 @@ if errorlevel 1 (
 
 echo.
 echo ============================================================
-echo  DONE!  Your app folder is here:
-echo  %~dp0dist\PDF_Circ_ID_Extractor\
+echo  DONE!
+echo  Your app is in:  %~dp0dist\PDF_Circ_ID_Extractor\
+echo  Run:  PDF_Circ_ID_Extractor.exe  inside that folder.
 echo.
-echo  Double-click PDF_Circ_ID_Extractor.exe inside that folder.
-echo  NOTE: On first launch, EasyOCR will download its model
-echo        (~100 MB) to your user profile. This only happens once.
+echo  FIRST LAUNCH STEPS:
+echo  1. Click the "OCR" button in the app
+echo  2. Make sure "Gemini Flash (FREE)" is selected
+echo  3. Paste your free Google API key
+echo     Get one at: aistudio.google.com/app/apikey
+echo  4. Click Save and Close
+echo  5. Add your PDFs and go!
 echo ============================================================
 echo.
 pause
