@@ -338,6 +338,63 @@ def _ocr_gemini(img_rgb: np.ndarray, api_key: str) -> str:
                     e.url, e.code, f"{e.reason}: {body}", e.headers, None)
 
 
+def _ocr_openrouter(img_rgb: np.ndarray, api_key: str) -> str:
+    """OpenRouter free-tier vision OCR — Qwen2.5-VL-72B primary, Llama fallback."""
+    import urllib.request, urllib.error, json as _j
+
+    # Upscale small crops so the model can read fine detail
+    h, w = img_rgb.shape[:2]
+    if w < 1200:
+        scale = 1200 / w
+        img_rgb = cv2.resize(img_rgb, (int(w * scale), int(h * scale)),
+                             interpolation=cv2.INTER_CUBIC)
+
+    b64 = _img_to_b64_png(img_rgb)
+    models = [
+        "qwen/qwen2.5-vl-72b-instruct:free",   # best free OCR model
+        "meta-llama/llama-3.2-11b-vision-instruct:free",  # fallback
+    ]
+    last_err = None
+    for model in models:
+        payload = _j.dumps({
+            "model": model,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text",      "text": _OCR_PROMPT},
+                    {"type": "image_url", "image_url": {
+                        "url": f"data:image/png;base64,{b64}"}}
+                ]
+            }],
+            "max_tokens": 80,
+            "temperature": 0
+        }).encode()
+        req = urllib.request.Request(
+            "https://openrouter.ai/api/v1/chat/completions",
+            data=payload,
+            headers={
+                "Authorization":  f"Bearer {api_key}",
+                "Content-Type":   "application/json",
+                "HTTP-Referer":   "https://github.com/uploaderpaul-byte/pdf-iso-drawing-renamer",
+                "X-Title":        "PDF Circuit ID Extractor",
+            })
+        try:
+            with urllib.request.urlopen(req, timeout=45) as r:
+                data = _j.loads(r.read())
+                return data["choices"][0]["message"]["content"].strip()
+        except urllib.error.HTTPError as e:
+            body = ""
+            try:
+                body = e.read().decode(errors="replace")[:300]
+            except Exception:
+                pass
+            last_err = f"HTTP {e.code}: {body}"
+            if e.code in (400, 404, 422):
+                continue   # model unavailable — try fallback
+            raise RuntimeError(f"OpenRouter error {e.code}: {body}")
+    raise RuntimeError(f"All OpenRouter models failed. Last error: {last_err}")
+
+
 def _ocr_easyocr(img_rgb: np.ndarray) -> str:
     """EasyOCR local fallback — no API key needed."""
     h, w = img_rgb.shape[:2]
@@ -368,9 +425,16 @@ def _render_roi(pdf_path: str, roi: dict, page_index: int = 0) -> np.ndarray:
 
 def extract_text_from_region(pdf_path: str, roi: dict, page_index: int = 0) -> str:
     """Dispatch to the configured OCR engine."""
-    img = _render_roi(pdf_path, roi, page_index)
+    img    = _render_roi(pdf_path, roi, page_index)
     cfg    = load_config()
-    engine = cfg.get("ocr_engine", "easyocr")
+    engine = cfg.get("ocr_engine", "openrouter")
+
+    if engine == "openrouter":
+        key = cfg.get("openrouter_key", "").strip()
+        if not key:
+            raise ValueError("OpenRouter selected but no API key saved. "
+                             "Open ⚙ OCR Settings to add your free key from openrouter.ai")
+        return _ocr_openrouter(img, key)
 
     if engine == "gpt4o":
         key = cfg.get("openai_key", "").strip()
@@ -386,7 +450,7 @@ def extract_text_from_region(pdf_path: str, roi: dict, page_index: int = 0) -> s
                              "Open ⚙ OCR Settings to add your key.")
         return _ocr_gemini(img, key)
 
-    # default — EasyOCR
+    # default — EasyOCR local
     return _ocr_easyocr(img)
 
 
@@ -1013,26 +1077,28 @@ class OCRSettingsDialog(ctk.CTkToplevel):
     FG_DIM = "#aaaaaa"
 
     ENGINES = [
-        ("gemini",  "🌟  Google Gemini 2.5 Flash  (FREE — best handwriting accuracy)"),
-        ("gpt4o",   "🔵  OpenAI GPT-4o mini   (≈ $0.001 / page)"),
-        ("easyocr", "💻  EasyOCR Local        (no key needed — less accurate)"),
+        ("openrouter", "🌟  OpenRouter  (FREE — best handwriting, no rate limits)"),
+        ("gpt4o",      "🔵  OpenAI GPT-4o mini   (≈ $0.001 / page)"),
+        ("gemini",     "🔴  Google Gemini  (unreliable free tier — not recommended)"),
+        ("easyocr",    "💻  EasyOCR Local  (no key needed — less accurate)"),
     ]
 
     def __init__(self, parent):
         super().__init__(parent)
         self.title("OCR Engine Settings")
-        self.geometry("600x480")
+        self.geometry("620x520")
         self.resizable(False, False)
         self.configure(fg_color=self.BG)
         self.grab_set()
 
         cfg = load_config()
-        self._engine_var  = tk.StringVar(value=cfg.get("ocr_engine", "gemini"))
-        self._gemini_var  = tk.StringVar(value=cfg.get("gemini_key", ""))
-        self._openai_var  = tk.StringVar(value=cfg.get("openai_key", ""))
+        self._engine_var      = tk.StringVar(value=cfg.get("ocr_engine", "openrouter"))
+        self._openrouter_var  = tk.StringVar(value=cfg.get("openrouter_key", ""))
+        self._gemini_var      = tk.StringVar(value=cfg.get("gemini_key", ""))
+        self._openai_var      = tk.StringVar(value=cfg.get("openai_key", ""))
 
         self._build_ui()
-        self._on_engine_change()   # show/hide correct key field
+        self._on_engine_change()
 
     def _build_ui(self):
         pad = {"padx": 24, "pady": 6}
@@ -1047,29 +1113,46 @@ class OCRSettingsDialog(ctk.CTkToplevel):
             font=ctk.CTkFont(size=11), text_color=self.FG_DIM
         ).pack(anchor="w", padx=24, pady=(0, 14))
 
-        # ── engine radio buttons ──────────────────────────────────────
         for value, label in self.ENGINES:
             ctk.CTkRadioButton(self, text=label,
                                variable=self._engine_var, value=value,
                                font=ctk.CTkFont(size=12),
                                text_color=self.FG,
                                fg_color=self.HILIGHT,
-                               hover_color="#c73652",
+                               hover_color="#aa0000",
                                command=self._on_engine_change
                                ).pack(anchor="w", **pad)
+
+        # ── OpenRouter key row ────────────────────────────────────────
+        self._openrouter_frame = ctk.CTkFrame(self, fg_color=self.PANEL, corner_radius=8)
+        self._openrouter_frame.pack(fill="x", padx=24, pady=(10, 0))
+
+        ctk.CTkLabel(self._openrouter_frame,
+            text="OpenRouter API Key  —  free signup at  openrouter.ai/keys  (no credit card)",
+            font=ctk.CTkFont(size=11), text_color=self.FG_DIM
+        ).pack(anchor="w", padx=12, pady=(10, 2))
+
+        _or_entry = ctk.CTkEntry(self._openrouter_frame, textvariable=self._openrouter_var,
+                     placeholder_text="sk-or-v1-…  paste your OpenRouter key here",
+                     show="•", width=560, height=32,
+                     font=ctk.CTkFont(size=12),
+                     fg_color=self.ACCENT, text_color=self.FG,
+                     border_color=self.ACCENT)
+        _or_entry.pack(padx=12, pady=(0, 10))
+        _bind_context_menu(_or_entry)
 
         # ── Gemini key row ────────────────────────────────────────────
         self._gemini_frame = ctk.CTkFrame(self, fg_color=self.PANEL, corner_radius=8)
         self._gemini_frame.pack(fill="x", padx=24, pady=(10, 0))
 
         ctk.CTkLabel(self._gemini_frame,
-            text="Google API Key   (free at  aistudio.google.com/app/apikey)",
+            text="Google API Key   (aistudio.google.com/app/apikey)",
             font=ctk.CTkFont(size=11), text_color=self.FG_DIM
         ).pack(anchor="w", padx=12, pady=(10, 2))
 
         _gemini_entry = ctk.CTkEntry(self._gemini_frame, textvariable=self._gemini_var,
                      placeholder_text="Paste your Google API key here…",
-                     show="•", width=540, height=32,
+                     show="•", width=560, height=32,
                      font=ctk.CTkFont(size=12),
                      fg_color=self.ACCENT, text_color=self.FG,
                      border_color=self.ACCENT)
@@ -1087,16 +1170,15 @@ class OCRSettingsDialog(ctk.CTkToplevel):
 
         _openai_entry = ctk.CTkEntry(self._openai_frame, textvariable=self._openai_var,
                      placeholder_text="Paste your OpenAI API key here…",
-                     show="•", width=540, height=32,
+                     show="•", width=560, height=32,
                      font=ctk.CTkFont(size=12),
                      fg_color=self.ACCENT, text_color=self.FG,
                      border_color=self.ACCENT)
         _openai_entry.pack(padx=12, pady=(0, 10))
         _bind_context_menu(_openai_entry)
 
-        # ── save button ───────────────────────────────────────────────
         ctk.CTkButton(self, text="Save & Close",
-                      fg_color=self.HILIGHT, hover_color="#c73652",
+                      fg_color=self.HILIGHT, hover_color="#aa0000",
                       width=160, height=36,
                       font=ctk.CTkFont(size=13, weight="bold"),
                       command=self._save
@@ -1104,22 +1186,22 @@ class OCRSettingsDialog(ctk.CTkToplevel):
 
     def _on_engine_change(self):
         eng = self._engine_var.get()
-        # Show/hide the relevant key frame
-        if eng == "gemini":
+        self._openrouter_frame.pack_forget()
+        self._gemini_frame.pack_forget()
+        self._openai_frame.pack_forget()
+        if eng == "openrouter":
+            self._openrouter_frame.pack(fill="x", padx=24, pady=(10, 0))
+        elif eng == "gemini":
             self._gemini_frame.pack(fill="x", padx=24, pady=(10, 0))
-            self._openai_frame.pack_forget()
         elif eng == "gpt4o":
-            self._gemini_frame.pack_forget()
             self._openai_frame.pack(fill="x", padx=24, pady=(10, 0))
-        else:
-            self._gemini_frame.pack_forget()
-            self._openai_frame.pack_forget()
 
     def _save(self):
         cfg = load_config()
-        cfg["ocr_engine"] = self._engine_var.get()
-        cfg["gemini_key"] = self._gemini_var.get().strip()
-        cfg["openai_key"] = self._openai_var.get().strip()
+        cfg["ocr_engine"]     = self._engine_var.get()
+        cfg["openrouter_key"] = self._openrouter_var.get().strip()
+        cfg["gemini_key"]     = self._gemini_var.get().strip()
+        cfg["openai_key"]     = self._openai_var.get().strip()
         save_config(cfg)
         self.destroy()
 
@@ -1162,14 +1244,16 @@ class PDFRenamerApp:
             self._log("ROI loaded from saved config.", "info")
         else:
             self._log("Using default ROI — click '🗺 Set ROI' to configure.", "info")
-        engine = cfg.get("ocr_engine", "gemini")
-        if engine in ("gemini", "gpt4o"):
-            key_name = "gemini_key" if engine == "gemini" else "openai_key"
-            if not cfg.get(key_name, "").strip():
+        engine = cfg.get("ocr_engine", "openrouter")
+        key_map = {"openrouter": "openrouter_key", "gemini": "gemini_key",
+                   "gpt4o": "openai_key"}
+        if engine in key_map:
+            if not cfg.get(key_map[engine], "").strip():
+                name = {"openrouter": "OpenRouter", "gemini": "Google",
+                        "gpt4o": "OpenAI"}[engine]
                 self._log(
                     f"No API key set — click '⚙ OCR' and paste your "
-                    f"{'Google' if engine == 'gemini' else 'OpenAI'} API key to get started.",
-                    "warning")
+                    f"{name} API key to get started.", "warning")
 
     # ------------------------------------------------------------------
     # UI construction
@@ -1333,9 +1417,9 @@ class PDFRenamerApp:
     # ------------------------------------------------------------------
 
     def _engine_label(self) -> str:
-        e = load_config().get("ocr_engine", "gemini")
-        return {"gemini": "Gemini 2.5 Flash", "gpt4o": "GPT-4o mini",
-                "easyocr": "EasyOCR (local)"}.get(e, e)
+        e = load_config().get("ocr_engine", "openrouter")
+        return {"openrouter": "OpenRouter (Qwen2.5-VL)", "gemini": "Gemini Flash",
+                "gpt4o": "GPT-4o mini", "easyocr": "EasyOCR (local)"}.get(e, e)
 
     def _poll_ocr_ready(self):
         cfg = load_config()
