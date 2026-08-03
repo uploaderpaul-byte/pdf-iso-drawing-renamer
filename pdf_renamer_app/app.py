@@ -217,6 +217,10 @@ def _ocr_gpt4o(img_rgb: np.ndarray, api_key: str) -> str:
         return _j.loads(r.read())["choices"][0]["message"]["content"].strip()
 
 
+_gemini_lock          = threading.Lock()
+_gemini_last_call_ts  = 0.0          # epoch seconds of last successful send
+_GEMINI_MIN_INTERVAL  = 4.1          # seconds between calls — keeps under 15 req/min
+
 def _ocr_gemini(img_rgb: np.ndarray, api_key: str) -> str:
     import urllib.request, urllib.error, json as _j, time
     url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
@@ -231,18 +235,25 @@ def _ocr_gemini(img_rgb: np.ndarray, api_key: str) -> str:
     }).encode()
     req = urllib.request.Request(url, data=payload,
                                  headers={"Content-Type": "application/json"})
-    # Retry up to 4 times on 429 (rate-limit); back off 5 s, 15 s, 30 s, 60 s
-    wait_times = [5, 15, 30, 60]
-    for attempt, wait in enumerate(wait_times + [None]):
-        try:
-            with urllib.request.urlopen(req, timeout=30) as r:
-                return (_j.loads(r.read())["candidates"][0]
-                        ["content"]["parts"][0]["text"].strip())
-        except urllib.error.HTTPError as e:
-            if e.code == 429 and wait is not None:
-                time.sleep(wait)
-                continue
-            raise
+
+    global _gemini_last_call_ts
+    # Serialise all Gemini calls; enforce minimum gap to avoid 429s
+    with _gemini_lock:
+        gap = time.time() - _gemini_last_call_ts
+        if gap < _GEMINI_MIN_INTERVAL:
+            time.sleep(_GEMINI_MIN_INTERVAL - gap)
+        # Retry up to 3 times on 429 with increasing back-off
+        for wait in [10, 30, 60, None]:
+            try:
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    _gemini_last_call_ts = time.time()
+                    return (_j.loads(r.read())["candidates"][0]
+                            ["content"]["parts"][0]["text"].strip())
+            except urllib.error.HTTPError as e:
+                if e.code == 429 and wait is not None:
+                    time.sleep(wait)
+                    continue
+                raise
 
 
 def _ocr_easyocr(img_rgb: np.ndarray) -> str:
@@ -624,17 +635,23 @@ class InteractiveROIDialog(ctk.CTkToplevel):
             self._status_var.set(f"Auto-detect failed: {exc}")
 
     def _test_ocr(self):
-        self._status_var.set("Running OCR on selected region…")
+        self._status_var.set("Running OCR… (may take a few seconds)")
         self.update()
-        try:
-            text = extract_text_from_region(self.pdf_path, self.roi)
-            if text:
-                self._status_var.set(f"OCR result: {repr(text)}")
-            else:
-                self._status_var.set("OCR returned empty — try adjusting the box or "
-                                     "check the drawing quality")
-        except Exception as exc:
-            self._status_var.set(f"OCR error: {exc}")
+        roi_snap = dict(self.roi)
+
+        def _worker():
+            try:
+                text = extract_text_from_region(self.pdf_path, roi_snap)
+                if text:
+                    msg = f"OCR result: {repr(text)}"
+                else:
+                    msg = ("OCR returned empty — try adjusting the box or "
+                           "check the drawing quality")
+            except Exception as exc:
+                msg = f"OCR error: {exc}"
+            self.after(0, self._status_var.set, msg)
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _apply(self):
         if self.roi["right"] - self.roi["left"] < 0.01 or \
