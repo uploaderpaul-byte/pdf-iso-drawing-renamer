@@ -227,13 +227,26 @@ def _ocr_gpt4o(img_rgb: np.ndarray, api_key: str) -> str:
 
 
 _gemini_lock          = threading.Lock()
-_gemini_last_call_ts  = 0.0          # epoch seconds of last successful send
-_GEMINI_MIN_INTERVAL  = 6.5          # seconds between calls — keeps under 10 req/min (2.5 Flash free tier)
+_gemini_last_call_ts  = 0.0   # epoch seconds of last successful send
+_GEMINI_MIN_INTERVAL  = 5.0   # seconds between calls — safe for all free-tier models
+_gemini_model_cache   = None  # once discovered, reuse the working model name
+
+# Candidates tried in order — best first, known-good fallback last
+_GEMINI_MODEL_CANDIDATES = [
+    "gemini-2.5-flash-preview-05-20",
+    "gemini-2.5-flash-preview-04-17",
+    "gemini-2.0-flash",
+]
+
+def _gemini_url(model: str, api_key: str) -> str:
+    return (f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{model}:generateContent?key={api_key}")
 
 def _ocr_gemini(img_rgb: np.ndarray, api_key: str) -> str:
     import urllib.request, urllib.error, json as _j, time
-    url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
-           f"gemini-2.5-flash:generateContent?key={api_key}")
+
+    global _gemini_last_call_ts, _gemini_model_cache
+
     # Upscale small crops so the model can read fine text clearly
     h, w = img_rgb.shape[:2]
     if w < 1200:
@@ -249,27 +262,40 @@ def _ocr_gemini(img_rgb: np.ndarray, api_key: str) -> str:
         ]}],
         "generationConfig": {"maxOutputTokens": 80, "temperature": 0}
     }).encode()
-    req = urllib.request.Request(url, data=payload,
-                                 headers={"Content-Type": "application/json"})
 
-    global _gemini_last_call_ts
     # Serialise all Gemini calls; enforce minimum gap to avoid 429s
     with _gemini_lock:
         gap = time.time() - _gemini_last_call_ts
         if gap < _GEMINI_MIN_INTERVAL:
             time.sleep(_GEMINI_MIN_INTERVAL - gap)
-        # Retry up to 3 times on 429 with increasing back-off
-        for wait in [10, 30, 60, None]:
-            try:
-                with urllib.request.urlopen(req, timeout=30) as r:
-                    _gemini_last_call_ts = time.time()
-                    return (_j.loads(r.read())["candidates"][0]
-                            ["content"]["parts"][0]["text"].strip())
-            except urllib.error.HTTPError as e:
-                if e.code == 429 and wait is not None:
-                    time.sleep(wait)
-                    continue
-                raise
+
+        # Build candidate list — start with cached model if we found one before
+        candidates = ([_gemini_model_cache] if _gemini_model_cache
+                      else _GEMINI_MODEL_CANDIDATES)
+
+        last_exc = None
+        for model in candidates:
+            req = urllib.request.Request(
+                _gemini_url(model, api_key), data=payload,
+                headers={"Content-Type": "application/json"})
+            # Retry this model up to 3 times on 429
+            for wait in [10, 30, 60, None]:
+                try:
+                    with urllib.request.urlopen(req, timeout=30) as r:
+                        _gemini_last_call_ts = time.time()
+                        _gemini_model_cache  = model   # remember what worked
+                        return (_j.loads(r.read())["candidates"][0]
+                                ["content"]["parts"][0]["text"].strip())
+                except urllib.error.HTTPError as e:
+                    if e.code == 429 and wait is not None:
+                        time.sleep(wait)
+                        continue
+                    if e.code == 404:
+                        last_exc = e
+                        break   # try next model candidate
+                    raise
+        # All candidates exhausted
+        raise last_exc or RuntimeError("No working Gemini model found")
 
 
 def _ocr_easyocr(img_rgb: np.ndarray) -> str:
