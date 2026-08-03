@@ -220,7 +220,7 @@ def _ocr_gpt4o(img_rgb: np.ndarray, api_key: str) -> str:
 def _ocr_gemini(img_rgb: np.ndarray, api_key: str) -> str:
     import urllib.request, json as _j
     url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
-           f"gemini-1.5-flash:generateContent?key={api_key}")
+           f"gemini-2.0-flash:generateContent?key={api_key}")
     payload = _j.dumps({
         "contents": [{"parts": [
             {"text": _OCR_PROMPT},
