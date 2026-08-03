@@ -173,13 +173,22 @@ def save_config(cfg: dict):
 # ===========================================================================
 
 _OCR_PROMPT = (
-    "This image is a crop of a title block from an engineering ISO piping drawing. "
-    "Your job is to extract the Circuit ID (sometimes labelled 'Circuit ID', "
-    "'Line No', 'Pipe No', or similar). "
-    "It typically looks like an alphanumeric code such as P-0800-P-2-073 or "
-    "P-2600-P-2-001, possibly handwritten. "
-    "Return ONLY the extracted code — no punctuation, no explanation, nothing else. "
-    "If you see multiple lines, return only the Circuit ID line."
+    "You are reading a cropped section of a title block from an engineering ISO "
+    "piping drawing. Your ONLY task is to extract the Circuit ID (also called "
+    "'Line Number', 'Line No', 'Pipe No', 'Circuit No', or 'Equipment ID').\n\n"
+    "The Circuit ID is always a structured alphanumeric code made of letters, "
+    "numbers, and hyphens. Examples of real formats:\n"
+    "  P-3200-KOH-2-005\n"
+    "  1-LI-32038-0196-TR\n"
+    "  100-P-14400-M41-3-001\n"
+    "  PAS3200-PR-PI-ENG-011\n\n"
+    "It may be printed or handwritten. Read every character carefully, including "
+    "whether letters are upper or lower case, and whether hyphens separate segments.\n\n"
+    "Rules:\n"
+    "- Return ONLY the Circuit ID code itself — no label, no explanation, no quotes.\n"
+    "- If you see multiple codes, return the one in the cell labelled "
+    "'CIRCUIT', 'LINE', 'PIPE', or 'EQUIPMENT ID'.\n"
+    "- Do not guess. If nothing matches a structured alphanumeric code, return UNKNOWN."
 )
 
 
@@ -219,19 +228,26 @@ def _ocr_gpt4o(img_rgb: np.ndarray, api_key: str) -> str:
 
 _gemini_lock          = threading.Lock()
 _gemini_last_call_ts  = 0.0          # epoch seconds of last successful send
-_GEMINI_MIN_INTERVAL  = 4.1          # seconds between calls — keeps under 15 req/min
+_GEMINI_MIN_INTERVAL  = 6.5          # seconds between calls — keeps under 10 req/min (2.5 Flash free tier)
 
 def _ocr_gemini(img_rgb: np.ndarray, api_key: str) -> str:
     import urllib.request, urllib.error, json as _j, time
     url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
-           f"gemini-2.0-flash:generateContent?key={api_key}")
+           f"gemini-2.5-flash:generateContent?key={api_key}")
+    # Upscale small crops so the model can read fine text clearly
+    h, w = img_rgb.shape[:2]
+    if w < 1200:
+        scale = 1200 / w
+        img_rgb = cv2.resize(img_rgb, (int(w * scale), int(h * scale)),
+                             interpolation=cv2.INTER_CUBIC)
+
     payload = _j.dumps({
         "contents": [{"parts": [
             {"text": _OCR_PROMPT},
             {"inline_data": {"mime_type": "image/png",
                              "data": _img_to_b64_png(img_rgb)}}
         ]}],
-        "generationConfig": {"maxOutputTokens": 60, "temperature": 0}
+        "generationConfig": {"maxOutputTokens": 80, "temperature": 0}
     }).encode()
     req = urllib.request.Request(url, data=payload,
                                  headers={"Content-Type": "application/json"})
@@ -931,7 +947,7 @@ class OCRSettingsDialog(ctk.CTkToplevel):
     FG_DIM = "#aaaaaa"
 
     ENGINES = [
-        ("gemini",  "🌟  Google Gemini Flash  (FREE — 1,500 pages/day)"),
+        ("gemini",  "🌟  Google Gemini 2.5 Flash  (FREE — best handwriting accuracy)"),
         ("gpt4o",   "🔵  OpenAI GPT-4o mini   (≈ $0.001 / page)"),
         ("easyocr", "💻  EasyOCR Local        (no key needed — less accurate)"),
     ]
@@ -1252,7 +1268,7 @@ class PDFRenamerApp:
 
     def _engine_label(self) -> str:
         e = load_config().get("ocr_engine", "gemini")
-        return {"gemini": "Gemini Flash", "gpt4o": "GPT-4o mini",
+        return {"gemini": "Gemini 2.5 Flash", "gpt4o": "GPT-4o mini",
                 "easyocr": "EasyOCR (local)"}.get(e, e)
 
     def _poll_ocr_ready(self):
