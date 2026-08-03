@@ -350,9 +350,12 @@ def _ocr_openrouter(img_rgb: np.ndarray, api_key: str) -> str:
                              interpolation=cv2.INTER_CUBIC)
 
     b64 = _img_to_b64_png(img_rgb)
+    # Free vision models confirmed available on OpenRouter (checked live)
     models = [
-        "qwen/qwen2.5-vl-72b-instruct:free",   # best free OCR model
-        "meta-llama/llama-3.2-11b-vision-instruct:free",  # fallback
+        "google/gemma-4-31b-it:free",                          # best free, 31B, image+text
+        "google/gemma-4-26b-a4b-it:free",                      # fallback, 26B
+        "nvidia/nemotron-nano-12b-v2-vl:free",                 # VL fallback
+        "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",  # omni fallback
     ]
     last_err = None
     for model in models:
