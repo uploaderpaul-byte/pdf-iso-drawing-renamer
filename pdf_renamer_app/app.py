@@ -218,7 +218,7 @@ def _ocr_gpt4o(img_rgb: np.ndarray, api_key: str) -> str:
 
 
 def _ocr_gemini(img_rgb: np.ndarray, api_key: str) -> str:
-    import urllib.request, json as _j
+    import urllib.request, urllib.error, json as _j, time
     url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
            f"gemini-2.0-flash:generateContent?key={api_key}")
     payload = _j.dumps({
@@ -231,9 +231,18 @@ def _ocr_gemini(img_rgb: np.ndarray, api_key: str) -> str:
     }).encode()
     req = urllib.request.Request(url, data=payload,
                                  headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return (_j.loads(r.read())["candidates"][0]
-                ["content"]["parts"][0]["text"].strip())
+    # Retry up to 4 times on 429 (rate-limit); back off 5 s, 15 s, 30 s, 60 s
+    wait_times = [5, 15, 30, 60]
+    for attempt, wait in enumerate(wait_times + [None]):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return (_j.loads(r.read())["candidates"][0]
+                        ["content"]["parts"][0]["text"].strip())
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and wait is not None:
+                time.sleep(wait)
+                continue
+            raise
 
 
 def _ocr_easyocr(img_rgb: np.ndarray) -> str:
